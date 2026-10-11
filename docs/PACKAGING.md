@@ -10,7 +10,7 @@ npm run client:build        # 只生成 build/client/www（想用自己的静态
 
 ## 1. 原理
 
-浏览器客户端是按服务器的挂载布局写的（游戏仓库的 `server/index.js`）：`/`→`public/`、`/data/`→`data/`、`/shared/`→`shared/`、`/sim/`→`server/sim/**/*.js`，外加服务器现生成的 `/data.js`（`server/data.js` 的浏览器替身）。打包好的客户端没有 Node 服务器，所以：
+浏览器客户端是按服务器的挂载布局写的（游戏仓库的 `server/index.js`）：`/`→`public/`、`/data/`→`data/`、`/shared/`→`shared/`、`/sim/`→`server/sim/**/*.js`，0.2.0 起再加一条可选的 `/packs/`→`packs/`（`server/http/static.js`：`/packs/index.json` 是这台服务器的内容包登记，口语包（界面译文 + 游戏文本）由它列出来，实际文件在 `public/i18n/` 与 `data/`；`/packs/<id>/<file>` 只放登记点名的文件），外加服务器现生成的 `/data.js`（`server/data.js` 的浏览器替身）。打包好的客户端没有 Node 服务器，所以：
 
 1. `tools/package-client.mjs` 把**游戏仓库 checkout** 的这些挂载点**摊平**成一个目录 `build/client/www/`——任何静态文件服务器或 Android WebView 都能直接托管，`/js/...`、`/data/...`、`/sim/...` 这些绝对路径照常解析；顺带生成 `data.js`（垫片）、`js/runtime-config.js`（服务器地址）、`js/shell/*`（选择服务器页）与 `build.json`（构建来源）。
 2. 客户端要连远程服务器，需要几处源码级改动：`js/net.js` 的 `defaultWsUrl()` 读 `globalThis.__SP_SERVER__`、`js/screens/room.js` 的邀请链接指向远程网页版、`index.html` 在模块图之前载入 `/js/runtime-config.js` 与 `/js/shell/picker.js`。**这些改动不在游戏仓库里**，而是以 `patches/game-client.patch` 的形式打在 payload 副本上（见 §7），游戏仓库保持与上游逐字节一致。
@@ -25,6 +25,7 @@ npm run client:build        # 只生成 build/client/www（想用自己的静态
 | 目标 | 需要 |
 |---|---|
 | 通用 | Node.js 22 / 24；一个**游戏仓库 checkout**（`Stronghold-Protocol`，默认同级 `../Stronghold-Protocol`，可用 `--game` / `SP_GAME_ROOT` / `client.config.json` 指定），且已 `npm install` + `npm run assets` 下载素材——**没有素材的客户端只是个空壳** |
+| gitignore 的派生登记 | `public/assets/`、`public/fonts/`、`public/vendor/`、`data/local-assets.json` 都**不入 git**，所以**每个 checkout 各有一份**。新开一个 worktree 直接打包，包里就没有立绘（不静音，是整层不长出来）。语音语言这一层 0.2.x 换了写法：可选项现在是树里的常量（`public/js/ui/gameLogic/settings.js` 导出的 `VOICE_LANGS`，`audio.js` 按 `settings.voiceLang` 选 `audio.voice` / `audio.voiceJp`），不再是"扫一遍素材再写出来的登记文件"；`data/voice-langs.json` 与 `tools/voice-langs.mjs` 在 0.2.2 的树里**已经不存在**，也没有代码读它（整树 grep 零命中）。旧 payload 里那份是 0.1.4 时代（fork 自己那套 `public/js/ext/voiceLang*.js`，也被上游吸收掉了）的遗留文件，`cut-payload.yml` 明确不再从上一版把它拷回来。至于 UI 文案的多语言，那是另一套：`packs/` + 打包时由游戏仓 `tools/packs.mjs index` 现生成的 `packs/index.json`。 |
 | exe | 无额外要求（`electron` / `electron-builder` 由 `desktop/` 的 `npm install` 装）；出 zip 用资源管理器右键，出 7z/zip 更小可用 7-Zip（可选） |
 | apk | JDK 17+（`JAVA_HOME`）、Android SDK（`ANDROID_HOME`）含 `platforms;android-36` 与 `build-tools;36.0.0`、并已接受许可协议（见 §5） |
 
@@ -174,15 +175,18 @@ Android 不需要这个处理：Capacitor 固定从 `https://localhost` 提供�
 
 **关于 `allowMixedContent`**：WebView 的页面本身是 `https://localhost`（`androidScheme`），而自建的局域网服务器只有 `ws://`（没有证书），Chromium 会把它当 mixed content 拦掉——`usesCleartextTraffic` 只管系统层的明文策略，管不了这个。所以 APK 里打开了 `allowMixedContent`，让选择服务器页里的 `ws://<局域网地址>:3000` 能用。**代价**：这一层保护没了，页面里的其他连接也可以降级到明文；官方服务器仍然走 `wss://`。不想要局域网联机的话，把 `mobile/capacitor.config.json` 改回 `false` 重新打包即可（`localhost` 属于"可信来源"，不受影响）。
 
-产物：`mobile/android/app/build/outputs/apk/debug/app-debug.apk`（debug 签名，可直接安装）。安装：`adb install -r <apk>`，或把 APK 拷到手机点开（需允许「安装未知应用」）。
+产物：`mobile/android/app/build/outputs/apk/release/app-release.apk`（release 签名，可直接安装）。安装：`adb install -r <apk>`，或把 APK 拷到手机点开（需允许「安装未知应用」）。
 
-发布用的 release APK 需要自己签名：
+> 2026-10-07 之前这里写的是"debug 包，可直接安装；发布用的 release 需要自己签名"，并给了一条 `keytool -genkeypair`
+> 的待办。**那条待办已经落地，而且落地方式是"必须有固定钥匙，否则 release 直接失败"**：
+> debug 包签的是每个 CI runner 现生成的一次性钥匙，玩家覆盖安装必报 -7（要卸载重装，连带丢 localStorage）。
+> 钥匙、指纹、闸门、玩家侧影响与轮换流程见 **`docs/ANDROID-SIGNING.md`**。
+> 本地随手测试仍然可以 `./gradlew assembleDebug`（不需要那把钥匙），但**发给玩家的必须是 release**。
 
-```bash
-keytool -genkeypair -keystore stronghold.jks -alias stronghold -keyalg RSA -keysize 2048 -validity 10000
-# 在 mobile/android/app/build.gradle 里加 signingConfigs 并让 release 用它，然后：
-node tools/package-android.mjs --release
-```
+CI 那条路（`build-clients.yml` 的 android job）已经自带钥匙：它从仓库 secret 解出 `mobile/android/keystore/`，
+跑 `assembleRelease`，再用 `apksigner` 核对产物指纹。本地跑 `node tools/package-android.mjs --release` 时需要自己写
+`mobile/android/keystore.properties`（四个键的名字见 `docs/ANDROID-SIGNING.md` §3），缺它时 gradle 会 throw 而不是
+出一个装不上的未签名包。
 
 ### 首次准备 Android SDK
 
@@ -258,7 +262,7 @@ media-alias flag 有写、**签名是关的**、共享 scheme 在库里、`Info.
 | 多人页 | 服务器列表 + **添加服务器**（名称 + 地址）、**直接连接**（只填地址，不进列表；先用探测选通用那条地址再进入）、**编辑**（改选中的自建服务器；内置与打包默认服不可改）、**刷新**（重新测一遍所有延迟，放在"返回"左边）、**返回** |
 | 地址写法 | `host`、`host:port`、`http(s)://…`、`ws(s)://…`，不用手写协议：不带协议时带端口的按 `ws://` 猜（`:443` 除外），公网域名默认 `wss://`。候选 = **协议 × 路径**：`toWsUrl()` 保留粘贴的路径（`https://host/play` → `wss://host/play/ws`），`picker-core.js` 的 `orderCandidates()` 再补上根挂载那条（`wss://host/ws`），地址没写协议时两种协议都补，最多 4 条。命中后把**通了的那条**存进 `sp.shell.server`（`ambiguousScheme` 决定哪些地址需要双协议，`pathOf` 决定失败文案提不提路径） |
 | 列出的服务器 | 内置项只有 `本机 / 局域网 localhost:3000`（`shell/picker-core.js` 的 `BUILTIN_SERVERS`，给自己开服的人）；`--server` 打包指定的地址会标"默认"并排在前面（**当前发布的产物是 `sp.lain42.top`**）；玩家自己添加的服务器（按 `js/net.js` 的 `toWsUrl()` 归一化，存在客户端本地；旧的"只存地址字符串"列表在读取时会升级成 `{name, address}`） |
-| 网友服播种 | `picker-core.js` 的 `COMMUNITY_SERVERS`（每条 `{name, address}`，只收实测 `/ws` 握手成功过的地址；`test/picker.test.js` 钉住"表里不许出现已测死的 host"）由 `picker.js` 的 `seedCommunityServers()` 在模块加载时写进 `K_LIST`，并写 `sp.shell.seed = SEED_VERSION`。三个要点：① **播种到可删列表而不是 BUILTIN_SERVERS** —— 别人的服会关，玩家必须删得掉，内置项不给删；② 有标记才不会把删掉的那条又种回来（要推新一批就升 `SEED_VERSION`）；③ 去重键由调用方注入（传 `toWsUrl`），所以玩家自己手填过同一个服就不会重复。种子跑在覆盖层不显示的那条路径上，F2 打开时看到的是同一份列表 |
+| 网友服播种 | `picker-core.js` 的 `COMMUNITY_SERVERS`（每条 `{name, address}`，收条目的门槛是**协议层**的 `hello`→`welcome`，不是 `/ws` 握手成功过 —— 见 §17；`test/picker.test.js` 钉住"表里不许出现已测死的 host"、地址能被 `addressError` 接受、而且没有两行归一成同一个 socket URL）由 `picker.js` 的 `seedCommunityServers()` 在模块加载时写进 `K_LIST`，并写 `sp.shell.seed = SEED_VERSION`。三个要点：① **播种到可删列表而不是 BUILTIN_SERVERS** —— 别人的服会关，玩家必须删得掉，内置项不给删；② 有标记才不会把删掉的那条又种回来（要推新一批就升 `SEED_VERSION`）；③ 去重键由调用方注入（传 `toWsUrl`），所以玩家自己手填过同一个服就不会重复。种子跑在覆盖层不显示的那条路径上，F2 打开时看到的是同一份列表 |
 | 探测 | 直接开 `/ws`（和游戏同一条通道，因此不依赖服务器 CORS），4 条候选**同时**开，一轮结束后最佳猜测重试一次 → 死地址约 2×`PROBE_TIMEOUT_MS`（8 s）出结果；绿点 = 真的能连进去。握手失败在浏览器里拿不到原因，所以 `/healthz` 会用 `mode: 'no-cors'` 再问一次（它对任何 HTTP 状态都 resolve，只有主机没答才 reject）：答了 → 卡片写"对方在线，但 `/ws` 没通"（`probeReason`），没答 → 保持"无法连接"（安卓壳拦明文 `http://`，不能据此断言主机无响应）。服务器给了 `Access-Control-Allow-Origin` 还能读 JSON，显示 `v<app> · 在线 n · 房间 n`； socket 失败时会等 `/healthz` 落定再收（等不到就按 `PROBE_TIMEOUT_MS` 截止），否则秒断的握手永远抢在那句结论前面 |
 | 记住上次 | 桌面端勾"记住并直接进入"后下次直接进游戏；想换服务器按 **F2**，或用 `--choose-server` 启动。Android 没有 F2，所以每次都显示、默认不记住（否则玩家换了服务器就回不去了） |
 | 优先级 | `--server <地址>`（本次运行）> `?server=<地址>` > 菜单记住的地址 > 打包默认地址 |
@@ -300,7 +304,7 @@ node scripts/notice.mjs --clear        # 撤回
 
 | | 打包进去什么 |
 |---|---|
-| 打包 | `public/**`（含 `assets`、`fonts`、`vendor`、`webfonts`）、`data/**`、`shared/**`、`server/sim/**/*.js`（去掉 Node 专用的 `nodeData.js`）、生成的 `data.js` / `build.json` / `js/runtime-config.js` / `js/shell/picker.js` / `js/shell/picker-core.js`、`local-assets.json`（没做本地提取时给空清单）、打补丁后的 `index.html` / `js/net.js` / `js/screens/room.js` |
+| 打包 | `public/**`（含 `assets`、`fonts`、`vendor`、`webfonts`）、`data/**`、`shared/**`、`server/sim/**/*.js`（去掉 Node 专用的 `nodeData.js`）、`packs/**` 与切包时由游戏仓自己的 `tools/packs.mjs index` 生成的 `packs/index.json`（0.2.0 的语言菜单读它；问的是 **checkout** 不是摊平后的 `www/`，因为 `public/` 已经并进根）、生成的 `data.js` / `build.json` / `js/runtime-config.js` / `js/shell/picker.js` / `js/shell/picker-core.js`、`local-assets.json`（没做本地提取时给空清单）、打补丁后的 `index.html` / `js/net.js` / `js/screens/room.js` |
 | 不打包 | 游戏仓库的 `server/` 其余部分（HTTP / WS / 大厅 / 对局引擎）、`docs/`、`test/`、`.cache/`、`.tools/`、`node_modules/` |
 
 `tools/package-client.mjs` 是**增量**的：文件大小与修改时间没变就跳过，源文件删掉后产物里的对应文件也会被删——重建很快（第二次通常 0 个文件被写入）。
@@ -416,3 +420,353 @@ package.bat --portable                    # 桌面改出单文件便携 exe
 - 上游改了 `public/index.html`、`js/net.js`、`js/screens/room.js` 时补丁会先失败（这是设计好的报警）：按 §9 重新生成 `patches/game-client.patch` 再跑。
 - 缺 JDK 17+ / Android SDK 时脚本**跳过 APK 并继续**（只报一句警告）。本机实测可用 `C:\Program Files\Java\jdk-21` 与 `%LOCALAPPDATA%\Android\Sdk`，脚本会自己找。
 - Windows 下 zip 用系统自带的 `tar -a`（bsdtar）；想要更小就自己用 7-Zip 的 LZMA2（见 §4.1）。
+
+## 14. Tauri 壳（`tauri/`，另一条流水线 `build-tauri.yml`）
+
+玩家报的两条是**体积大**和**启动慢**，这两条各有各的账，得分开算：
+
+| 账 | 实测 | 归谁 |
+| --- | --- | --- |
+| 目录版解包后 | 1,145.4 MiB，其中 payload（素材+代码）825.4 MiB | **素材** —— 离线进对局不下载换来的 |
+| 同上，扣掉 payload | **320.0 MiB 是 Electron 自带的运行时** | 壳 —— Tauri 用系统 WebView2 替掉它 |
+| payload 自己的首屏 | 153 个请求 / **5.47 MiB** / 到标题页可点 438 ms | 与壳无关；0.2.0→0.2.1 只涨到 5.47 MiB（c21 是 5.46 MiB / 409 ms） |
+| `portable.exe` | 每次启动把整包自解压到临时目录（实测一个实例留下 **974 MB**） | 形态 —— 与 Electron/Tauri 都无关 |
+
+所以 Tauri 治的是那 320 MiB，治不了 825 MiB 的素材；启动慢的主因是**单文件自解压形态**，
+因此这条流水线**只出目录版与安装器，不出 portable**。
+
+那 825.4 MiB 里都是什么（2026-10-08 对**已发布**的 c22 ipa 量的，sha256 `2fa871d8…`，13,968 个文件；
+命令本身是出厂闸门脚本的一个模式，apk / 目录都能读）：
+
+```
+node tools/check-payload-offline.mjs --sizes --zip Stronghold-0.2.1-c22-ios-unsigned.ipa --prefix Payload/App.app/public/
+```
+
+| 目录 | 大小 | 文件数 | 是什么 |
+| --- | --- | --- | --- |
+| `assets/spine` | 394.3 MiB | 3,050 | 干员/敌人的骨骼与贴图页 —— **这就是"立绘"本身** |
+| `assets/audio` | 188.3 MiB | 6,057 | BGM 与音效 |
+| `assets/char` | 79.8 MiB | 976 | 头像 180×180 与半身立绘 180×360 |
+| `assets/local` | 60.9 MiB | 1,488 | 从官方客户端抽出来的 3D 棋盘素材（含整包里最大的那几张 2048×2048 贴图） |
+| `assets/ui` | 39.2 MiB | 602 | 界面图与攻略页大图 |
+| 其余（`assets/enemy|skill|band|…`、`data` `dev` `webfonts` `sim` `vendor` `js` …） | 63.0 MiB | 1,795 | 剩下的图、数据、开发页、字体镜像、对局模拟、三方库 |
+
+再想往下砍只有两条路，都不合现在的产品约定：素材改成按需下载（那就不是"离线进对局"了），
+或者砍皮肤/语音档（那是玩家要的东西）。所以这一节的结论是**别在素材上动刀，壳侧的收益见 §16**。
+
+壳的形态：`tauri/src-tauri/src/server.rs` 是一个 std 手写的只监听 `127.0.0.1:47821` 的静态服务器，
+窗口加载 `http://127.0.0.1:47821/` —— **故意与 Electron 壳用同一个 origin**：Chromium/WebView2 按 origin 划分
+localStorage，博士代号、干员调配、设置、记住的服务器全在里面，端口随机或改用 `tauri://localhost`
+都会让玩家以为存档丢了。端口被占时先认清"占它的是不是本游戏自己的页面"（`occupied_by_us`），
+是就退出而不是退到 47822 —— 那等于悄悄换了 origin；c26 起在这之前还先看一个**内核命名互斥量**
+（`already_running`），因为端口探针只看得见已经在服务的实例，看不见正在启动的实例，
+两次双击挤在一起时仍然会开出第二个 origin。真的挪了端口（别人占着 47821）时也不再静默：弹一句说明
+"这个窗口里代号/编队/设置会是空的，因为那是按端口存的"。
+
+`server.rs` 是 `desktop/serve.mjs` 的手抄，所以有 `test/tauri-parity.test.js` 把两边的
+MIME 表、`/media` 扩展名**顺序**、长缓存目录集合、端口常量从**源码里各读一遍**再逐条比（抄错不会有人发现：
+`.skel` 的 Content-Type 错就是 Spine 静默不显示，`/media` 少一种扩展名就是全体静音）。
+Rust 侧的规则另有 `cargo test`（遍历、别名顺序、Range 钳制、ETag 与 `Date.toUTCString()` 逐字节一致）。
+两条都在 `build-tauri.yml` 里当闸门用，不绿不打包。
+
+`SP_TAU_BOOT_PROBE=1` 时窗口不抬起来，壳自己数"页面把 `js/main.js` 取走"用了多少毫秒、这中间收了几个请求、
+用了几条 TCP 连接，打印
+`boot_probe first_request_ms=… main_js_ms=… requests=… connections=…`。流水线里那一步现在**是硬闸门**
+（c25 起，以前是 `continue-on-error`，等于装饰）：去掉控制台窗口之后，这一行同时是"stdout 还可达"的唯一证据；
+connections 那半个字段是 c26 加的，并且**连接数不少于请求数就判红** —— 否则哪天退回到"一个连接一个请求"，
+这一行照样打印，没人会去看数字（见 §16）。runner 上没有可用 WebView2 时这一步也会红，那是环境问题不是产物问题。
+
+**c24 的两个形态实测大小**（同一份 payload，`build-tauri.yml` run `37671372625`）：
+
+| 形态 | 字节 | 与 Electron 同形态差 |
+| --- | --- | --- |
+| `StrongholdProtocolTauri_0.2.1_x64-setup.exe`（发布时资产名 `StrongholdProtocolTauri-0.2.1-setup.exe`） | 549,072,012 B（523.6 MiB） | 比 `Setup.exe`（637,943,028 B）**少 84.8 MiB，−13.9 %** |
+| 目录版 `out/StrongholdProtocolTauri` | 打成 `StrongholdProtocolTauri-0.2.1-dir.zip` = 598,017,671 B；解包 858 MB（含 www） | Electron 目录版解包是 1,145.4 MiB |
+
+省下来的正是上面那张账里的那部分 Electron 运行时。同一次 runner 上的探针是
+`first_request_ms=9148 main_js_ms=10107 requests=24` —— **这个数不能拿来当"启动快/慢"的结论**：
+共享 runner 上 WebView2 是冷启动、没有硬件加速、运行时可能还得现下载。README 因此把这一行标成"试验"，
+真实机器上的启动表现等玩家回报；装机版仍然只出目录版与安装器两种，**不出 portable**（自解压那条账与壳无关）。
+
+内容侧这一轮也逐个对过：`StrongholdProtocolTauri-0.2.1-dir.zip` 里 `StrongholdProtocolTauri/www/**`
+与本地 payload **13,966 / 13,966 一致（0 缺 0 多 0 字节差）**，和 Electron 目录版是同一标准。
+CI 侧另有三道：`cargo test`（遍历/别名顺序/Range 钳制/日期格式）+ `test/tauri-parity.test.js`
+（两张表从两边源码各读一遍再比）+ 对**产物内 www** 再跑一次零外链闸门。
+
+## 15. c25：壳自己的两条真机反馈（黑控制台 + F2）
+
+玩家自己装了 Tauri 版，报了两条，都是壳的问题，与游戏内容无关 —— 所以这一版**只重发 Tauri 那一个资产**
+（Release `tauri-v0.2.1-c25`），Electron / apk / ipa 继续用 `v0.2.1-c24` 那五个，不让人白重下 3.5 GB。
+
+| 症状 | 根因 | 修法 |
+| --- | --- | --- |
+| 启动时多一个黑色控制台，里面是 `[tauri] 静态服务 port=47821 root=…` | Rust 二进制默认是 **console 子系统**，`main.rs` 没有 `windows_subsystem` 属性 | `#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]`。少了 `not(test)` 会连 `cargo test --release` 的日志一起关掉 |
+| 按 F2 没反应 | F2/F5/F11/F12 只在 **Electron 壳的原生层**实现（`desktop/main.mjs` 的 `before-input-event`），Tauri 一条都没有，网页版也没有 | 改成页面级：规则进 `picker-core.js` 的 `isPickerHotkey`（只有不带修饰键、非连发的 F2 算），接线进 `picker.js`。Electron 那条原生路径保留（它先 `preventDefault`，所以不会重复触发；`showPicker()` 也幂等） |
+
+两个连带点，别漏：
+
+1. **没有控制台之后，启动失败就没人看得见**。所以致命错误改弹原生消息框（对齐 Electron 的
+   `dialog.showErrorBox`）；`MessageBoxW` 用 `#[link(name = "user32")]` 直接声明，不为此引入 windows 绑定 crate。
+   "47821 上已经是我们自己的页面"那一支单独走**信息框 + exit(0)**，它不是故障。
+   **CI 的探针模式（`SP_TAU_BOOT_PROBE`）绝不弹框** —— 模态框会把那一步挂到超时。
+2. **`picker.js` / `picker-core.js` 是逐字复制进 payload 的**，所以 F2 这一条必须重切 payload（c25）。
+   这也是为什么"只修壳"仍然产生了一个新的 payload 标签。
+
+c25 实测（`build-tauri.yml` run `37729406637`，全绿）：安装器 `StrongholdProtocolTauri-0.2.1-c25-setup.exe`
+= **549,073,131 B**（比 c24 那份多 1,119 B，就是那两个 JS 文件的差）；目录版 zip 598,018,637 B，
+里面 `www/**` 与 payload 13,966/13,966 一致；**从安装器里取出** `www/js/shell/picker.js`、
+`picker-core.js`、`build.json` 三个文件，sha256 与本地树逐个相等，F2 接线在里面。
+启动探针这次是 `first_request_ms=3132 main_js_ms=3217 requests=24` —— 与上一次的 9148/10107 差三倍，
+**只能说明共享 runner 的冷热水位不同，不能当"变快了"**；那一步现在是从 `continue-on-error` 改成的硬闸门，
+它同时是"去掉控制台之后 stdout 仍然可达"的唯一证据。
+
+## 16. c26：壳侧的四个优化（连接复用 / F12 / 单实例 / 端口挪走不再静默）
+
+payload 一个字节没动（还是 `payload-v0.2.1-c25` 那份 tar），所以这一版仍然只发 Tauri 一个资产，
+其它四个形态继续用 `v0.2.1-c24`。
+
+| 改了什么 | 为什么 | 实测 |
+| --- | --- | --- |
+| 静态服务改成按**连接**服务（keep-alive） | 每个回答都 `Connection: close` 是手抄漏的一条：Node 的 `http.Server` 白送连接复用。一局里几百个文件，在 Electron 上走 6 条 socket，在 Tauri 上就是几百次 TCP 连接 + 几百个 OS 线程，而日志只会显示"变慢了" | run `37770244660` 的启动探针：`requests=24 connections=6`（平均每条 4 个请求，正是 Chromium 对单源的 HTTP/1.1 连接上限）。c25 那次同一份 payload 也是 `requests=24`，当时没有 connections 这个字段，但按代码每个回答都关连接，那 24 个请求必然是 24 条连接 |
+| 续用连接时发 `Connection: keep-alive` + `Keep-Alive: timeout=5`，空闲超时也从 15 秒改成同一个 5 秒 | 我先写的断言是"Node 续用时不多发任何头"，那是**猜的**；真跑一遍 `desktop/serve.mjs`（同一条 socket 连发两问）才看到它发的就是这两行。parity 测试现在起 JS 那份服务实测、把 timeout 秒数从 Node 的头里抠出来再要求 Rust 源码里有同样的字面量 —— Node 改主意会先红，而不是两边各自漂 | `test/tauri-parity.test.js` 两条（结构 + 实测对照）；Rust 侧另有 3 条真跑 socket 的用例（一条连接拿两个回答 / 1.0 与 POST 之后确实断 / 416 之后连接仍可用），`cargo test` 在 Windows runner 上全绿 |
+| release 版打开 devtools（F12） | 玩家报"白屏 / 立绘没出来"时，有问题的只有那一台机器，而 release 壳没有控制台。Tauri 只在 debug 构建默认给 devtools | `tauri = { features = ["devtools"] }`；WebView2 自带检查器，所以安装器体积几乎不动（见下表）。**"按下去有没有面板"仍然只有装了的人能回答**，这条写在 Release 说明里请玩家回话 |
+| 单实例先看内核命名互斥量；端口真被挪走时弹一句 | 端口探针只看得见已经在服务的实例，看不见正在启动的实例 —— 两次双击挤在一起时第二个会退到 47822 开出一个新 origin；而换 origin 等于换 localStorage（代号/编队/设置都在里面） | 顺序钉在测试里：互斥量 → 端口探针 → 绑端口。15 秒那个旧空闲值也被断言禁掉，防止回退 |
+
+大小账（三个形态的安装器都来自同一份 payload，所以差的是壳自己的字节）：
+
+| Release | Tauri 安装器 | 与上一版差 |
+| --- | --- | --- |
+| `v0.2.1-c24`（`StrongholdProtocolTauri-0.2.1-setup.exe`） | 549,072,012 B | — |
+| `tauri-v0.2.1-c25` | 549,073,131 B | +1,119 B（那两个 shell JS 文件） |
+| `tauri-v0.2.1-c26`（`…-c26-setup.exe`，sha256 `214ac4b5…`） | 549,072,683 B | −448 B |
+
+发布这一版时顺手修了一个玩家可见的配置错误：`gh release create` 默认会把新 Release 标成 **Latest**，
+于是 c25 那个"只有一个资产"的 Release 抢走了本该属于 `v0.2.1-c24`（五个形态）的 Latest 标签 ——
+仓库页的"最新.release"点进去只剩 Tauri 安装器。已 `gh release edit v0.2.1-c24 --latest=true` 改回，
+c26 起用 `--latest=false` 创建，并且每次发完都要用 `gh release list` 看一眼标签在哪
+（`gh release view --json` 根本没有 `isLatest` 字段，查不了）。
+
+没做的两条也记在这儿：**F11 全屏**当时仍然只在 Electron 的原生层有（要页面能调壳的能力，等于必须重切 payload，
+见任务里的说明）—— 这一条已在 §18 实现，但 `picker.js` 是逐字复制进 payload 的，所以要随下一次重切（c27）才到玩家
+手里；第二次双击仍然只提示、不把已开的窗口抬到前面（那需要跨进程喊话 + 一次主线程调用）。
+
+## 17. 网友服复测：门槛是 `hello`→`welcome`，而且要两个出口
+
+`tools/probe-community-servers.mjs` 把"这台是不是真的还在跑 Stronghold"变成一条能重跑的测量。它只做一件事：
+开一条 `/ws`，发一个 `hello`，读回帧，然后关掉 —— 不进房、不发别的动词、不拉字节。
+
+**为什么不能只看握手**：任何反向代理都会回 `101`，源站没了也照样回。所以判定只有一个 —— 服务器在 `hello` 之后
+回 `welcome`。
+
+**探针自己必须先是对的**，否则健康的服务器会把它读成客户端坏了。三条来自游戏仓的规则：
+
+- `rid` 给了就必须是**整数**（`shared/protocol.js:435`）—— 这次最初写的是 `rid: 'probe1'`，于是**每台**健康服务器
+  都回 `BAD_MSG`，本机报出「10 台全死」。改成 `rid: 1` 之后，之前显示"被拒"的五台全部回 `welcome`。
+- `name` 非空且 ≤ `NAME_MAX_LEN = 12`（`shared/constants.js:22`，`validateC2S` 用 `v.length`，一个汉字算 1）。
+  默认名因此是「探针」而不是「探针 · 只测连接」。
+- 拒绝的原因在 error 帧的 **`detail`** 里（`server/net.js:328` 的 `errorMsg(code, rid, detail)`），`code` 只是
+  `BAD_MSG` 这种机器码。原来只打印 `code`，等于把唯一那句诊断丢掉。
+
+`--control`（默认官方服）是**阳性对照**：它证明发出去的帧本身合法，所以对照失败时整张表的排名不作数（`exit 1`）。
+`test/probe-community-servers.test.js` 里那三条阴性对照跑的是一个手写的 RFC 6455 服务端（不是探针自己的代码）：
+按协议回 `welcome` ⇒ 必须报 `welcome` 并带 `app`；回 `BAD_MSG` ⇒ `verdict` 与 `detail` 都要能看出是被拒；只握手
+不回帧 ⇒ 报超时而不是 `welcome`。另外端口没人听时 `TCP:ECONNREFUSED` 会出现在诊断列里 —— WebSocket 的 `error`
+事件不带原因，所以 `连不上（error）` 那句话本来是没信息量的。
+
+**出口（vantage）和帧一样重要。** 本机走 TUN 代理，代理给每个域名发一个 `198.18.0.x` 的假 IP：这一行里所有诊断
+（连 TCP 通不通）都只是在描述代理自己，所以工具直接把解析到的 IP 打出来并标「本行不可信」。2026-10-08 两个出口的
+实测：
+
+| 条目 | GitHub runner（海外，干净出口） | 本机（代理） | 处理 |
+|---|---|---|---|
+| 对照 `sp.lain42.top` | `welcome` 5358 ms（→ 8.153.102.122） | `welcome`（本地源码服的阳性对照 17 ms） | — |
+| linxia / nekotc / chiruno / ausevaywstr | `welcome` 1076–8395 ms | `welcome` 561–1387 ms | 保留（两个出口都通过） |
+| **103.205.253.194:27527** | `welcome` 1440 ms | `welcome` 53 ms | **本次新增**，`SEED_VERSION` 2→3 |
+| 183.66.27.19:20522 | `TCP 超时` 15496 ms | `welcome` 108 ms | 保留 —— 海外连不到那个端口，直连 IP 那一侧是有效测量 |
+| misyra / rainya / xiaolubao | `TCP 通`但 `/ws` 握手被拒 | 连不上（假 IP） | 保留，但**记下待复测** |
+| rainya:10166 | `TCP 超时` | 连不上（假 IP） | 同上 |
+| cranepaul:8443 | `TLS:ERR_SSL_TLSV1_UNRECOGNIZED_NAME` | 同错（假 IP） | 同上 |
+
+那四行"沉默"的条目**没有删**，理由是后果不对称：列表里一行死的服务器只是玩家看到的一个灰点、而且他自己删得掉；
+删掉一行则所有新装玩家再也看不见它。而"从海外 runner 连不到一台中国大陆的服务器"根本不是对方宕机的证据。要删就得
+再有一个大陆出口复测一次（线上那台机器可以，但那要动服务器，先不做）。
+
+重跑：
+
+```bash
+node tools/probe-community-servers.mjs --timeout 6000                  # 本机（看每行解析到的 IP 才知可信度）
+node tools/probe-community-servers.mjs --control http://127.0.0.1:<本地源码服端口>   # 阳性对照，不依赖外网
+gh workflow run probe-servers.yml -R lilyco-42/StrongholdProtocolClient --ref main \
+  -f timeout_ms=12000 -f 'extra=网友服 · foo=https://foo.example/'        # 干净出口；红的是测量结果，不是流水线坏了
+```
+
+**`tools/ws-url.mjs` 现在是被钉住的逐字拷贝**。它是播种条目的去重键（`picker.js` 把 `js/net.js` 的 `toWsUrl` 注入
+`missingSeeds`），而它原来是对补丁里那段代码的改写版 —— 改写版把不带端口的 `[::1]` 归一成 `wss://`，补丁里的代码
+给出 `ws://`。`test/ws-url.test.js` 从 `patches/game-client.patch` 重新抽出新增行、逐个函数按文本比对，再让两份
+实现跑同一批输入对答案；`test/picker.test.js` 另外钉住"没有两行种子归一成同一个 socket URL"。
+
+## 18. F11 全屏：页面 → 壳的一条命令路由（任务 #64）
+
+Electron 壳早就有 F11（`desktop/main.mjs:168` 在 `before-input-event` 里 `win.setFullScreen()` 再 `preventDefault()`），
+网页版有浏览器自己的 F11，只有 Tauri 壳两头都没实现 —— 玩家按下去什么都不会发生。
+
+**为什么不走 HTML5 全屏**：`document.documentElement.requestFullscreen()` 在 WebView2 里只铺满客户区，标题栏和
+任务栏都还在（宿主得响应 `ContainsFullScreenElementChanged` 才会真的全屏，而 wry 不响应）。那样两个壳按同一个键
+得到两种不同的东西，比"另一个没有"更糟。
+
+**为什么不走 Tauri 的 JS 窗口 API**：capability 要按 **origin** 授权，而这个壳的 origin 是"它抢到的那个环回端口"
+（47821 起、连找 16 个、都不行就交给系统）。写成 allowlist 的后果是端口被占满的那名玩家静默失去 F11，
+而且换到的是整个窗口 API 的权限，不是一件事。
+
+所以走的是**页面自己 origin 上的一条路由**：`POST /__shell__/fullscreen`。静态服务与窗口在同一个进程里，
+`server.rs` 收到就通过 `run_on_main_thread` 把动作递给窗口（窗口操作只能在事件循环那根线程做），并**等它回话**
+再答 —— 响应正文是 `fullscreen=on|off|error|…`，不是 `accepted`，这样"命令排上了队"与"窗口真的变了"在日志里
+是两种话。窗口还没建好时答 503：`picker.js` 把状态码记进 `globalThis.__SP_F11_STATE__`，于是
+`sending / sent:200 / sent:503 / no-shell` 四种"按了没反应"互相能分辨。
+
+页面这一侧只在**环回主机**上问（`shellFullscreenUrl()`）：其它主机上没有这条路由，往别人的服务器发一个 404 请求
+是纯噪音。命令名两边各写一遍字符串会静默错开 —— 症状就是"按了没反应"而两套测试都绿，所以
+`test/picker.test.js` 里有一条跨语言钉：从 `server.rs` 里正则取出 `SHELL_FULLSCREEN_PATH`，与
+`shellFullscreenUrl('127.0.0.1')` 逐字比。
+
+CI 能证明与不能证明的，说清楚：
+
+| 段 | 谁证明 |
+|---|---|
+| 路由 ↔ 命令名 ↔ 状态码 | `server.rs` 的三个测试（`FakeShell` 记命令名、GET 被 405 拒、没有处理器时 503） |
+| JS 与 Rust 的路由字符串一致 | `test/picker.test.js` 跨语言比对 |
+| 命令通道 ↔ **真实窗口** | `build-tauri.yml` 的启动探针：CI 里没有键盘，所以壳自己调两次，打印 `fullscreen_probe first=… second=…`，缺行或答 `pending/rejected/unavailable/no-window` 都判红 |
+| 真实按键 F11 → 页面收到 keydown | **没有人能证明**：Windows runner 上没有人手按键，而合成 `KeyboardEvent` 只能证明我自己的处理器，不能证明 WebView2 会把 F11 送进页面。要这条得真机按一次 |
+
+这条也因此必须**随 payload 重切**才生效：`picker.js` 是逐字复制进 payload 的。壳这一侧（路由 + 窗口调用）单独发
+上去也不会亮，两边要在同一个 c27 里。
+
+## 19. c27 → c28：为什么切了两刀，以及上传为什么必须一个一个来
+
+**c27 是"切完才发现玩家点不到"**。那一版已经把自检页打进了 payload，但 ipa/apk 只加载 `index.html`，
+没有任何东西链到 `/dev/spine-probe.html` —— 一张没人能打开的诊断页等于没有。所以加了选择页多人页右上角的
+「立绘自检」按钮（`picker.js`，同样是逐字进 payload 的内容），c27 的两条构建直接 cancel，重切 c28。
+教训写成了闸门：**四条 payload 完整性检查现在都收 `dev/spine-probe.html|js`**，按钮链到一个不存在的页面会在
+打包阶段判红，而不是等玩家报"点了没反应"。
+
+| Release | 内置资源 tar | 说明 |
+| --- | --- | --- |
+| `payload-v0.2.1-c27` | 599,992,393 B `c0d18363102445f2…` | 三件事齐了，但诊断页没有入口 → 不发货 |
+| `payload-v0.2.1-c28` | 599,991,734 B `31a55af76ff8684f…` | 同一个游戏提交 `v0.2.1-64-g309c42fc`（dirty:false），只多了那个按钮 |
+
+**玩家版 `v0.2.1-c28` 是六个形态在同一个 Release**（以前 Tauri 安装器单独放在 `tauri-v0.2.1-c2*`）。理由不是整洁：
+F11 要"新壳 + 新内置资源"两边都齐才生效，分两个 Release 就一定有人装错一半。
+
+**大文件上传要一个一个传，并且别看退出码。** `gh release create` 一次性带 6 个文件（约 3.8 GB）时被外层
+`timeout 1700` 中途杀掉，结果是**一个 untagged 的 Draft、assets=0**：`gh release view v0.2.1-c28` 按名字仍然能查到它
+（`tagName` 已经是这个值，但 git tag 没建），所以"查不到就是没建到一半"这个判断是错的 —— 要看 `isDraft` 和
+`url` 里的 `untagged-…`。改成单个文件上传后实测 549 MB / 3m09s（≈2.9 MB/s），digest 与本地逐字节一致，
+剩下的按序传完再 `gh release edit --draft=false` 发布（那一步才建 tag，也才会触发 `on: push: tags: v*` 那条矩阵）。
+
+---
+
+## 20. 打包与测试搬到 runner 上（`cut-payload.yml` / `test-game-branch.yml`）
+
+规矩是用户定的：**只有 GitHub Actions 可以编译、运行、测试**。这一条改变了本仓库的一个老前提 ——
+`build-clients.yml` 顶上写着「为什么不在 CI 里生成 payload」，理由是素材不在 git 里、CI 现拉上游会少掉我们补齐的那
+17 个文件。理由本身没错，但它假设的是「素材只能从上游拉」。现在我们自己发布的 payload tar 就是那批补齐过的素材，
+它已经在 GitHub 上，所以**素材从上一版 payload 取，代码从游戏仓取**，两者在 runner 上合体就够了。
+
+两条 lane 各管一半：
+
+| lane | 管什么 | 素材从哪来 |
+| --- | --- | --- |
+| `test-game-branch.yml` | 游戏仓 `npm test`（fork 自己没有 CI，这是唯一的兜底） | 上一版 payload tar 的 `public/assets\|fonts\|vendor` + `data/local-assets.json` |
+| `cut-payload.yml` | 打出 payload 本体并过六道闸门 | 同上（`data/voice-langs.json` 不再拷，见 §1 那一行），然后 `tools/fetch-assets.mjs` 补增量 |
+
+`cut-payload.yml` 存在的直接理由是 **`patches/game-client.patch` 的锚点**：补丁按上下文行匹配（`tools/unified-diff.mjs`
+允许 ±200 行漂移，但上下文内容变了就红）。上游 0.2.2 往 `public/js/screens/room.js` 的 import 区插了
+`openStats` / `SettingsButton` 两行，于是 `@@ -20,7 @@` 那一块再也不是连续的七行 —— 打包在
+`hunk @@ -20,7 @@ does not match` 处红。这个红是好事：它拦住的是一份**邀请链接仍然指向本机地址**的包。
+重锚的办法不改补丁语义，只换 hunk 头与上下文行（`@@ -22,7 @@` / `@@ -84,10 +84,11 @@`），改完必须在 runner 上重新打一次
+才算数，本机跑一次不算。
+
+闸门里最容易误解的两条：
+
+* **游戏树必须干净**（`git status --porcelain` 为空）。`build.json` 的 `game.dirty` 就是这条命令的非空判断，
+  provenance 闸门只接受 `dirty:false`。所以这一步**不装 npm 依赖** —— `npm install` 会改 `package-lock.json`，
+  树一脏这份包就追不到 commit（实测过：只有 ` M package-lock.json` 一行，看起来无害，闸门却红）。
+  packer 与 `fetch-assets` 只用 node 内建和游戏仓自己的相对模块，不需要依赖。
+  同理，如果 `data/assets.json` 被 `fetch-assets` 改写，那是**要回游戏仓提交**的东西，不能烤进 payload。
+  第一次跑被一条 `?? data/voice-langs.json` 挡下：那是 0.1.4 时代从上一版 payload 拷回来的派生登记，而 0.2.2 的树里
+  既没有生成它的工具也没有读它的代码（本文件 §1 那一行已经改成现实）。第一反应是"给它加 exclude"，但那会让包多带一个
+  没人读的文件、还让闸门为它弯一次规则 —— 正确的做法是不拷它：包应当正好反映那棵树。闸门红得对，改的是 lane。
+* **失败要能指名道姓**。`test-game-branch.yml` 原本是 `npm test 2>&1 | tail -60`：它把红的那条用例连同报错一起
+  扔掉了，日志里只剩 `# fail 1`，谁也不知道是哪一条。现在整份输出落盘、上传成 artifact，只把 `not ok` 行与
+  `error:/expected:/actual:` 打进日志。一个只会说「红了」的闸门不是闸门。
+
+`publish` 默认 `no`：第一次跑只验「补丁能不能打上、闸门过不过」，不产生任何对外可见的东西。
+要出包时先 `draft`（玩家看不到），核对 `build.json` 与 digest 之后再 `gh release edit --draft=false`。
+
+**收口这一步也在 runner 上（`publish-client.yml`）**：c28 那次是我本机 `gh run download` 三个 artifact（约 3.8 GB）
+再逐个上传 —— 那是纯中转，还差点把盘写满。这条 lane 的输入是两条流水线的 run id，产物在对象存储里内部搬一趟即完成。
+它第一次真跑教了三件事，都写进了 lane：① artifact 里的文件名是构建工具的默认名（`app-release.apk`、
+`Stronghold-ios-unsigned.ipa`），玩家报障说的是包名，所以 lane 要按 tag 自己改名，并且**形态核对要对最终文件名判**
+（`\.apk$` 对任何 apk 都成立，等于没判）；② 没有 checkout 的步骤里每个 `gh` 调用都要显式 `-R` 与 `GH_TOKEN`
+（`gh run download` 会先 `git rev-parse`，不是仓库就直接死）；③ Draft 的资产 URL 只有带 token 才取到，
+所以"匿名 200"这一条在 draft 模式下永远红 —— 它属于 `--draft=false` 之后，不是之前。
+
+已发布：`v0.2.2-c32` 六个形态，每条 URL 匿名 200，sha256 与 lane 里算的逐条一致
+（apk `72c54be5…`、ipa `e98795f9…`、desktop zip `fc8411dd…`、portable `1384760e…`、Setup `9a69cd7a…`、Tauri `6d397666…`）。
+Tauri 那份 `-dir.zip`（598 MB 解开的整棵树）不再发给玩家，与 c28 起的六个形态保持一致。
+tag 已存在就直接失败 —— 绝不覆盖已发布的资产。
+
+**第一份由这条 lane 出的包**：`payload-v0.2.2-c30`，资产 `sp-client-payload-0.2.2-c30.tar.gz`
+600,297,895 B，`sha256:c425763375674a7633a71428966035edbca737322f63e5a8e844e2d48d175035`，
+`build.json` 的 sha256 是 `bad91eb716f9e4c65e353a8236efd0ccce875c396ec5262f95528795c28d4cb3`
+（游戏 `0.2.2` / commit `b7dfc082` / dirty:false / describe `v0.1.3-646-gb7dfc08`）。
+它之后 exe / apk / ipa / Tauri 安装器都只从这一个 tar 出，`build-clients` 与 `build-tauri` 的 `payload_url`
+填 Release 的公开下载地址即可 —— 那条 URL 匿名 200，不再依赖欠费中的 `dl.lain42.top`。
+
+**c30 / c31 / c32 为什么是三刀**：c30 是第一刀（补丁重锚，闸门全绿，已公开）；c31 是第二刀，带的是
+`spine-probe` 页的"清单没加载不许报全通过"那一修（`feat/skins@642a8bb4`），它只到 Draft；WebKit 那一步第一次真跑
+又把这一页的第二个自坏挖出来（问美术索引用 chessId 而不是 charId，见 `docs/IOS-ART.md` §6），于是第三刀 c32
+（`feat/skins@082fc0a8`，600,300,419 B，`sha256:2043e9cfd58f…`）才是玩家拿到的那一份。已公开的东西一个都不动：
+payload Release 只增不改，编号跳号是有记录的（c16 也这样决定过不发玩家版）。
+
+**fork 的 tag 少了一截**：runner 里 `git describe` 报 `v0.1.3-648-g082fc0a`，而本机是 `v0.2.2-68-g082fc0a8` ——
+因为 fork 的 `origin` 只有到 `v0.1.3` 的 tag，上游的 `v0.2.0/v0.2.1/v0.2.2` 从来没推过去。已补推
+（`git push origin refs/tags/v0.2.2` 等三个）。这不改包的内容：provenance 认的是 `game.commit`（完整 sha）与
+`dirty:false`，describe 只是给人读的近似坐标 —— 但它读起来像 0.1.3 时代，就没人会信它，所以值得修。
+
+`--target` 这一脚踩过：`--target` 这一脚踩过：`gh release create --target <游戏的 sha>` 得到 `HTTP 422 Release.target_commitish is invalid`。
+Release 建在**客户端仓**上，target 必须是那个仓里的 ref/commit；游戏的出处由 `build.json` + provenance 闸门 + notes 承担，
+不需要（也不应该）由 tag 指向哪个 commit 来说。
+
+### 20.5 c33：第一刀带上「代码增量 + 清单」，也是 v0.2.3 那一刀
+
+上游 v0.2.3 合进 `feat/skins`（游戏仓 `2cb8387e`，两处冲突按"上游为底 + 我们独有整块补回"解，
+`data/assets.json` 见 `docs/AUTO-UPDATE.md` §5 的核对法）之后，`cut-payload` 出了 `payload-v0.2.3-c33`：
+
+| 资产 | 大小 | sha256（GitHub 报的 digest） |
+| --- | --- | --- |
+| `sp-client-payload-0.2.3-c33.tar.gz` | 605,331,987 B | `322b17ebd38056c4e3920f6d302e5da31bf2a52defa8ad0546e7d85886bd9ae6` |
+| `sp-client-code-v0.2.3-c33.tar.gz` | 10,443,390 B / 657 个文件 | `7555035406c941dffc9e787e8f2a57c164ecf59383431976ec00a1d20b390376` |
+| `sp-client-manifest-v0.2.3-c33.json` | 618 B | `6b052ccfd5d8b4c1fd5b3abbd9bf66e754e7495866648ee98b6263bbe7d03ef9` |
+
+代码增量是整包的约 **1/58**。清单里 `art.digest=sha256:dffe9b678634…`、`art.files=13,655`（c32 是 13,342），
+`game.describe=v0.2.3-71-g7b8a04ad`、`dirty=false`；`code.sha256` 与 GitHub 自己报的资产 digest 逐字节相同 ——
+这两条互为对照：清单说的那个 hash 真的能对上发布出去的资产，不是自说自话。
+**c32 及更早的 payload Release 里没有这两样**（只有整包 tar），所以"客户端读清单取增量"从 c33 起才有东西可读。
+
+这一刀踩到 / 修掉的三件事，都记在这儿因为它会再踩：
+
+1. **`fetch-assets` 需要依赖，而那一步以前故意不装。** 它起手就要 `@pixi-spine/runtime-3.8`，缺了它
+   **一个文件都不下**就抛错；当时的 `|| echo "继续,靠已拷进来的那批"` 把它压成一行 warn，于是这一刀一路走到
+   离线闸门才红：`12844 个 URL 里 313 个找不到`（全是上游新干员的素材）。改成先 `npm ci --ignore-scripts`
+   —— 用 `ci` 而不是 `install`，因为 `install` 会改写 `package-lock.json`，脏树打出来的包 provenance 闸门必红
+   （c29 实测过）。它顺手改写的 `data/assets.json` / `package-lock.json` 现在先印 diff 再丢弃。
+2. **`publish-client` 最后一道闸门在 Draft 模式下必红**：`gh api releases/tags/<tag>` 这个端点**看不见 Draft**，
+   而 `as_draft` 默认就是 `yes`。run 38030915965 六个产物全传完、digest 也逐条对过了，红的仍是核对本身。
+   改成先 `gh release view` 拿 release id，再按 id 列 assets。
+3. **`build-clients` 的 `push: tags: v*` 老触发已删**：发布玩家版会建 git tag，tag 一出现就又触发一整套构建，
+   而那一次用的是 `payload_url` 的默认值（`dl.lain42.top`，已 403）—— 看着像"发版顺带多验一次"，
+   实验的是另一份料。出哪个 payload 必须显式派发。
+
+玩家版 `v0.2.3-c33` 的六个形态与 digest 见 `gh release view v0.2.3-c33 --json assets`；
+`Latest` 已指向它（`payload-v0.2.3-c33` 不是 Latest，玩家落地页应该是客户端那个）。

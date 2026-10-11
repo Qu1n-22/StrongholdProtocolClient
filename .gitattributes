@@ -19,3 +19,9 @@ deploy/** text eol=lf
 *.png binary
 *.ico binary
 *.jar binary
+*.der binary
+*.p12 binary
+*.rs text eol=lf
+*.yml  text eol=lf
+*.toml text eol=lf
+*.lock text eol=lf

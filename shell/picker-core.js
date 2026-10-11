@@ -21,12 +21,22 @@ export const BUILTIN_SERVERS = Object.freeze([
 ]);
 
 /** Bump when COMMUNITY_SERVERS gains an entry existing installs should also get (a deleted one stays deleted). */
-export const SEED_VERSION = 1;
+export const SEED_VERSION = 3;
 
 /**
- * Servers run by other people, measured with the shipped picker code on 2026-10-05 (all five opened a `/ws`
- * handshake; `ark-proto.stardust.matce.cn` answers HTTP but has no game service on `/ws`, and
- * `xymx1234.github.io/stronghold-standalone/` is a static page, not a server — neither is listed here).
+ * Servers run by other people. The bar for being listed is protocol-level, not socket-level: `hello` must come back
+ * as `welcome` (`tools/probe-community-servers.mjs`), because any reverse proxy answers a `wss` handshake
+ * with 101 and then has nothing behind it.
+ *
+ * Measured 2026-10-05 and 2026-10-06 with the shipped picker code (then eight of eight answered `welcome`), and
+ * re-measured 2026-10-08 from two vantages — a GitHub Actions runner (clean egress) and this machine (behind a TUN
+ * proxy, which fabricates failures for every proxied hostname). Both vantages agree on `linxia` / `nekotc` /
+ * `chiruno` / `ausevaywstr` / `103.205.253.194` answering `welcome`. `183.66.27.19:20522` answers from here but its
+ * port does not answer from overseas, so it stays on the strength of the direct measurement. Five rows
+ * (`misyra`, `rainya`, `rainya:10166`, `xiaolubao`, `cranepaul`) did not answer from either vantage on 10-08 —
+ * **kept anyway, deliberately**: a dead row is one grey line the player can delete, while a deleted row is
+ * invisible to every new install, and one measurement window is thin evidence about someone else's server.
+ * Re-run the probe from a second mainland vantage before removing any of them.
  *
  * They are *seeded into the editable list* (`K_LIST`), not added to `BUILTIN_SERVERS`: a server that goes dark must
  * be something the player can delete for good, and a built-in row cannot be deleted or edited. Addresses below are
@@ -39,6 +49,21 @@ export const COMMUNITY_SERVERS = Object.freeze([
   { name: '网友服 · rainya:10166', address: 'https://sp.rainya.me:10166/play' },
   { name: '网友服 · linxia', address: 'https://wei.linxia.dev/' },
   { name: '网友服 · xiaolubao', address: 'https://game.xiaolubao.com/' },
+  // 2026-10-06 新增：这三台实测 `/ws` 能握手并回 welcome（healthz 分别报 0.1.3 / 0.1.3 / 0.1.3.3）。
+  // 评论区说它们带 匹配 / 倍速 / 外援干员 / 官方 3D 素材等改动 —— 那些是服主自己的功能，本客户端没有实测，
+  // 所以名字里只写主机，不替他们宣称功能。
+  { name: '网友服 · nekotc', address: 'https://sp.nekotc.cn' },
+  { name: '网友服 · chiruno', address: 'https://ark.chiruno.com/' },
+  { name: '网友服 · ausevaywstr', address: 'https://ausevaywstr.top/' },
+  // 裸 IP + http：`addressError` 允许 host:port，Android 是 usesCleartextTraffic="true"、iOS ATS 也放开，
+  // 所以三端都能连（实测 ws://183.66.27.19:20522/ws 回 welcome）。
+  { name: '网友服 · 183.66.27.19', address: 'http://183.66.27.19:20522/' },
+  // 2026-10-08 新增：两个出口都实测回 welcome（GitHub Actions 的海外 runner 1440 ms、本机 53 ms），所以这条是
+  // 双 vantage 通过的。评论区说它带自己的匹配队列 —— 那是服主的功能，本客户端没有实测，名字里只写主机。
+  { name: '网友服 · 103.205.253.194', address: 'http://103.205.253.194:27527/' },
+  // cranepaul 群里发的是 https://game.cranepaul.dpdns.org/，但它把 /ws 301 到 sk.…:8443/ws，
+  // 而 WebSocket 握手不跟随重定向 —— 填 game. 那个必然连不上，所以这里播种它自己的规范地址。
+  { name: '网友服 · cranepaul', address: 'https://sk.cranepaul.dpdns.org:8443/' },
 ]);
 
 /**
@@ -208,7 +233,76 @@ export function orderCandidates(first, ambiguous) {
  * @param {{ ok?: boolean, online?: boolean, hadPath?: boolean }} r a probe result
  * @returns {string} '' when it worked or nothing was learned, otherwise one clause for the card
  */
-export function probeReason({ ok, online, hadPath }) {
-  if (ok || !online) return '';
+export function probeReason({ ok, online, hadPath, timedOut }) {
+  if (ok) return '';
+  if (timedOut) return '本次握手超时，可能是网络波动；可以重试或直接连接';
+  if (!online) return '';
   return hadPath ? '对方在线，但 /ws 与该路径下的 /ws 都没通' : '对方在线，但 /ws 没通（多半没转发到游戏服务）';
+}
+
+/**
+ * Visit servers while keeping simultaneous network probes bounded.
+ * Each server may still test all of its possible WS URLs in parallel.
+ */
+export function forEachLimited(items, limit, visit) {
+  const max = Math.min(items.length, Math.max(1, Math.floor(limit) || 1));
+  let next = 0;
+  return Promise.all(Array.from({ length: max }, async () => {
+    while (next < items.length) {
+      const index = next++;
+      await visit(items[index], index);
+    }
+  }));
+}
+
+/**
+ * Is this key event the "换个服务器" hotkey? F2 alone, no modifiers, and not an auto-repeat.
+ *
+ * Why the rule lives here: the Electron shell intercepts F2 in the *native* layer
+ * (`desktop/main.mjs` `before-input-event`, which calls `preventDefault()`), so the page never sees it there.
+ * The Tauri shell has no native key handling at all (and neither does a browser), so `picker.js` listens for it in
+ * the page — one rule, three hosts, and the repeat/modifier cases are the part that is easy to get silently wrong.
+ * @param {string} [key] `KeyboardEvent.key`
+ * @param {boolean} [repeat] `KeyboardEvent.repeat`
+ * @param {{ctrlKey?: boolean, altKey?: boolean, metaKey?: boolean, shiftKey?: boolean}} [mods]
+ */
+export function isPickerHotkey(key, repeat, mods) {
+  if (key !== 'F2' || repeat) return false;
+  return !(mods && (mods.ctrlKey || mods.altKey || mods.metaKey || mods.shiftKey));
+}
+
+/**
+ * F11 = 全屏. Same reason `isPickerHotkey` lives here: the Electron shell already intercepts F11 natively
+ * (`desktop/main.mjs` `before-input-event` → `win.setFullScreen()`), so the page never sees it there; a browser has
+ * its own F11; only the Tauri shell has nothing. One rule, and the repeat/modifier cases are the part that goes
+ * wrong silently — holding F11 must not thrash fullscreen.
+ * @param {string} [key] `KeyboardEvent.key`
+ * @param {boolean} [repeat] `KeyboardEvent.repeat`
+ * @param {{ctrlKey?: boolean, altKey?: boolean, metaKey?: boolean, shiftKey?: boolean}} [mods]
+ */
+export function isFullscreenHotkey(key, repeat, mods) {
+  if (key !== 'F11' || repeat) return false;
+  return !(mods && (mods.ctrlKey || mods.altKey || mods.metaKey || mods.shiftKey));
+}
+
+/**
+ * The shell's own fullscreen command endpoint, or `null` when this page is not served by a shell.
+ *
+ * Why a request to *our own origin* instead of `window.__TAURI__.window.getCurrentWindow().setFullscreen()`:
+ * a capability that grants the JS window API has to name the page's origin, and this shell serves the page from
+ * whichever loopback port it got (47821 plus a 16-port search, then whatever the OS hands out) — so an allowlist
+ * would silently stop working for the rare player whose ports were all busy, and it would grant the whole window
+ * API rather than one action. The static server is in the same process as the window, so a POST to it reaches the
+ * window directly, on any port, and exposes exactly one thing.
+ *
+ * Gated to loopback hosts because everywhere else there is nothing to ask: Electron swallows F11 in its own
+ * `before-input-event` (the page never sees the key), and a browser has its own F11 — firing a request at a fan
+ * server that has no such route would be noise on someone else's box for zero effect.
+ * @param {string} [hostname] `location.hostname`
+ * @returns {string|null}
+ */
+export function shellFullscreenUrl(hostname) {
+  const h = String(hostname ?? '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (h !== '127.0.0.1' && h !== 'localhost' && h !== '::1') return null;
+  return '/__shell__/fullscreen';
 }

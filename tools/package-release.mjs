@@ -36,12 +36,17 @@ import { findGameRoot, readAppVersion, readProtocolVersion } from './game-contra
 import { buildDesktop } from './package-desktop.mjs';
 
 /** Files whose version field tracks the game repo (same set as commit 1ca6d71). */
-export const VERSION_JSON = Object.freeze(['package.json', 'desktop/package.json', 'mobile/package.json']);
+export const VERSION_JSON = Object.freeze(['package.json', 'desktop/package.json', 'mobile/package.json',
+  // Tauri 那一壳有两个 JSON：`tauri/package.json`（前端那半）与 `tauri/src-tauri/tauri.conf.json`，
+  // 加上 Cargo.toml 一共三处 —— build-tauri.yml 的版本闸门比的就是这三处对 payload 的 game.app。
+  // 少写一个的代价是"装出来的 exe 显示错版本"，实测漏掉 tauri/package.json 时闸门就红了。
+  'tauri/package.json', 'tauri/src-tauri/tauri.conf.json']);
 /** Lockfiles whose root + packages[""] version must follow (npm's own transitive entries never change). */
 export const VERSION_LOCKS = Object.freeze(['desktop/package-lock.json', 'mobile/package-lock.json']);
 const GRADLE = path.join('mobile', 'android', 'app', 'build.gradle');
 /** Xcode keeps its two version fields inside the project file (the Capacitor template hardcodes 1.0 / 1). */
 const PBXPROJ = path.join('mobile', 'ios', 'App', 'App.xcodeproj', 'project.pbxproj');
+const CARGO_TOML = path.join('tauri', 'src-tauri', 'Cargo.toml');
 
 /** Gradle's versionCode must be a monotonically rising integer; derive it from the semver (0.1.2 → 102). */
 export function versionCode(version) {
@@ -106,6 +111,15 @@ export function alignVersions(version) {
       .replace(/(\bMARKETING_VERSION = )[^;]+;/g, `$1${version};`)
       .replace(/(\bCURRENT_PROJECT_VERSION = )[^;]+;/g, (m, a) => (code == null ? m : `${a}${code};`));
     if (writeIfChanged(pbx, next)) changed.push(PBXPROJ.split(path.sep).join('/'));
+  }
+  // Tauri 那一版的第三个编号在 Cargo.toml（`version = "x.y.z"`），不在任何 JSON 里，所以要单独写。
+  // `build-tauri.yml` 的闸门会拿 payload 的 game.app 比 conf/Cargo/npm 三处，少改一处就是"装出来的 exe 显示错版本"
+  // （实测：payload 0.2.2 而 conf/cargo/npm 全 0.2.1，那条 lane 直接红）。既然闸门要求它们一起走，写入也必须
+  // 由这一个函数负责 —— 否则"改了七个文件、漏了 Cargo.toml"这种事每次切版本都要踩一次。
+  const cargo = path.join(CLIENT_ROOT, CARGO_TOML);
+  if (fs.existsSync(cargo)) {
+    const next = fs.readFileSync(cargo, 'utf8').replace(/^(version = ")[^"]*"/m, `$1${version}"`);
+    if (writeIfChanged(cargo, next)) changed.push(CARGO_TOML.split(path.sep).join('/'));
   }
   return changed;
 }

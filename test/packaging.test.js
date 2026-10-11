@@ -11,16 +11,17 @@
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import zlib from 'node:zlib';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { applyPatch, parsePatch, stripPath } from '../tools/unified-diff.mjs';
 import { versionCode } from '../tools/package-release.mjs';
-import { DATA_SHIM_JS, SIM_PRIVATE, findGameRoot, isGameRoot, readGameContract, verifyGameContract, readProtocolVersion } from '../tools/game-contract.mjs';
+import { DATA_SHIM_JS, SIM_PRIVATE, findGameRoot, isGameRoot, readGameContract, verifyGameContract, readProtocolVersion, findContractFile } from '../tools/game-contract.mjs';
 import { PATCHED_FILES, applyPayloadPatch, assertPatched } from '../tools/payload-patches.mjs';
 import { assembleClient, runtimeConfigSource, DEFAULT_SERVER, CLIENT_ROOT, SHELL_FILES, parseCommonArgs } from '../tools/package-client.mjs';
 import { desktopTargets } from '../tools/package-desktop.mjs';
@@ -150,9 +151,12 @@ describe('game-repo contract', { skip: GAME_ROOT ? false : 'no Stronghold-Protoc
     assert.ok(!text.includes('\uFEFF'), 'no BOM');
   });
 
-  test('DATA_SHIM_JS / SIM_PRIVATE match server/index.js', () => {
+  test('DATA_SHIM_JS / SIM_PRIVATE match the game server source', () => {
     assert.doesNotThrow(() => verifyGameContract(GAME_ROOT));
-    const { shim, simPrivate } = readGameContract(readFileSync(path.join(GAME_ROOT, 'server', 'index.js'), 'utf8'));
+    // 0.2.0 moved them from server/index.js to server/http/static.js — resolve, never hardcode
+    const rel = findContractFile(GAME_ROOT);
+    assert.ok(['server/http/static.js', 'server/index.js'].includes(rel), `unexpected contract home: ${rel}`);
+    const { shim, simPrivate } = readGameContract(readFileSync(path.join(GAME_ROOT, rel), 'utf8'), rel);
     assert.equal(shim, DATA_SHIM_JS);
     assert.deepEqual(simPrivate, [...SIM_PRIVATE]);
     assert.equal(typeof readProtocolVersion(GAME_ROOT), 'number');
@@ -161,9 +165,13 @@ describe('game-repo contract', { skip: GAME_ROOT ? false : 'no Stronghold-Protoc
 
   test('the shell serves the payload with the game server"s MIME table', async () => {
     const { MIME } = await import('../desktop/serve.mjs');
-    const src = readFileSync(path.join(GAME_ROOT, 'server', 'index.js'), 'utf8');
+    const rel = ['server/http/files.js', 'server/index.js'].find((r) => {
+      try { return /export const MIME = Object\.freeze\(/.test(readFileSync(path.join(GAME_ROOT, r), 'utf8')); } catch { return false; }
+    });
+    assert.ok(rel, 'MIME 表找不到：游戏仓库把它挪到了 server/ 下的哪个文件？');
+    const src = readFileSync(path.join(GAME_ROOT, rel), 'utf8');
     const block = /export const MIME = Object\.freeze\(\{([\s\S]*?)\n\}\);/.exec(src);
-    assert.ok(block, 'MIME 表解析失败：游戏仓库 server/index.js 的 MIME 写法变了');
+    assert.ok(block, `MIME 表解析失败：${rel} 的写法变了`);
     const pairs = [...block[1].matchAll(/'([^']+)':\s*'([^']+)'/g)].map((m) => [m[1], m[2]]);
     assert.ok(pairs.length > 20, `MIME 表只解析出 ${pairs.length} 条，解析可能失效`);
     assert.deepEqual({ ...MIME }, Object.fromEntries(pairs));
@@ -194,6 +202,53 @@ describe('game-repo contract', { skip: GAME_ROOT ? false : 'no Stronghold-Protoc
       const cssAt = html.indexOf('/css/shell-display.css');
       assert.ok(cssAt !== -1, 'index.html must link /css/shell-display.css');
       assert.ok(cssAt > html.lastIndexOf('/css/devices.css'), 'the shell stylesheet is loaded last');
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+    }
+  });
+});
+
+// auto-sync.yml 用 tools/check-patch-applies.mjs 的退出码决定"上游这一刀之后能不能自动出包"。一条只会报 0 的
+// 检查比没有检查更糟（它给绿灯），所以这里把三种出口都钉住：阴性对照（树漂移了必须报 3）、"其实什么都没检"
+// （缺文件必须报 2）、阳性（真树报 0）。前两条不需要游戏仓 checkout —— ci.yml 上没有游戏仓，阳性那条会显式 skip。
+describe('tools/check-patch-applies.mjs exit codes', () => {
+  const run = (args) => spawnSync(process.execPath, [path.join(ROOT, 'tools', 'check-patch-applies.mjs'), ...args], { encoding: 'utf8' });
+
+  test('漂移的树报 3：这条检查真的会红', () => {
+    const out = mkdtempSync(path.join(tmpdir(), 'sp-pc-out-'));
+    const drift = mkdtempSync(path.join(tmpdir(), 'sp-pc-drift-'));
+    try {
+      for (const f of PATCHED_FILES) write(drift, `public/${f}`, 'export {};\n');
+      const bad = run(['--game', drift, '--out', path.join(out, 'drift')]);
+      assert.equal(bad.status, 3, `期望 3，实际 ${bad.status}：${bad.stdout}${bad.stderr}`);
+      assert.match(bad.stdout, /补丁打不上/);
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+      rmSync(drift, { recursive: true, force: true });
+    }
+  });
+
+  test('树里根本没有那几个文件时报 2，不是"补丁没问题"', () => {
+    const out = mkdtempSync(path.join(tmpdir(), 'sp-pc-out-'));
+    const empty = mkdtempSync(path.join(tmpdir(), 'sp-pc-empty-'));
+    try {
+      const none = run(['--game', empty, '--out', path.join(out, 'none')]);
+      assert.equal(none.status, 2, `期望 2，实际 ${none.status}：${none.stdout}${none.stderr}`);
+      assert.match(none.stderr, /这一跑什么都没检/);
+      const usage = run([]);
+      assert.equal(usage.status, 2, `少参数必须报 2，实际 ${usage.status}`);
+    } finally {
+      rmSync(out, { recursive: true, force: true });
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  test('真树报 0', { skip: GAME_ROOT ? false : '旁边没有 Stronghold-Protocol checkout' }, () => {
+    const out = mkdtempSync(path.join(tmpdir(), 'sp-pc-out-'));
+    try {
+      const good = run(['--game', GAME_ROOT, '--out', path.join(out, 'good')]);
+      assert.equal(good.status, 0, `${good.stdout}${good.stderr}`);
+      assert.match(good.stdout, /补丁在这份游戏树上打得上/);
     } finally {
       rmSync(out, { recursive: true, force: true });
     }
@@ -240,6 +295,84 @@ describe('client payload assembly', () => {
     assert.ok(!readFileSync(path.join(game.root, 'public', 'js', 'net.js'), 'utf8').includes('__SP_SERVER__'), 'the checkout is never modified');
     // manifest.json lands next to www/ for the build scripts
     assert.equal(JSON.parse(readFileSync(path.join(game.root, 'build', 'client', 'manifest.json'), 'utf8')).server, DEFAULT_SERVER);
+  });
+
+  test('a mount subdir that is a symlink is mirrored, not skipped (worktrees link public/assets)', (t) => {
+    const game = makeGameFixture();
+    const artRoot = mkdtempSync(path.join(tmpdir(), 'sp-art-'));
+    const cleanup = () => {
+      rmSync(game.root, { recursive: true, force: true });
+      rmSync(path.dirname(game.patchFile), { recursive: true, force: true });
+      rmSync(artRoot, { recursive: true, force: true });
+    };
+    try {
+      const linked = path.join(game.root, 'public', 'assets');
+      renameSync(linked, path.join(artRoot, 'art'));
+      // 'junction' needs no privileges on Windows; the type is ignored on POSIX.
+      symlinkSync(path.join(artRoot, 'art'), linked, process.platform === 'win32' ? 'junction' : 'dir');
+    } catch (e) {
+      cleanup();
+      t.skip(`symlinks unavailable: ${e.code || e.message}`);
+      return;
+    }
+    try {
+      const out = path.join(game.root, 'build', 'linked', 'www');
+      const r = assembleClient({ gameRoot: game.root, patchFile: game.patchFile, out, log: () => {} });
+      assert.equal(r.missingAssets, false, 'the linked assets/ must count as present');
+      assert.ok(existsSync(path.join(out, 'assets', 'char', 'x.png')), 'assets/char/x.png behind the link');
+      assert.equal(readFileSync(path.join(out, 'assets', 'char', 'x.png'), 'utf8'), 'png');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('a game checkout with tools/packs.mjs gets its pack index generated into the payload', () => {
+    // 0.2.0: js/ui/lang.js lists the language packs from /packs/index.json, which only the server generates.
+    // A packaged client has no server, so the payload must carry the file — generated by the game repo's own tool.
+    const game = makeGameFixture();
+    const tool = `#!/usr/bin/env node
+// stand-in for the game repo's tools/packs.mjs: writes the index of the --root tree to --out
+import fs from 'node:fs';
+import path from 'node:path';
+const a = process.argv.slice(2);
+const at = (k) => a[a.indexOf(k) + 1];
+const root = at('--root'), out = at('--out');
+const langs = fs.existsSync(path.join(root, 'public/i18n')) ? fs.readdirSync(path.join(root, 'public/i18n')).filter((f) => f.endsWith('.json')) : [];
+fs.mkdirSync(path.dirname(out), { recursive: true });
+fs.writeFileSync(out, JSON.stringify({ version: 1, packs: langs.map((f) => ({ type: 'lang', id: f.replace(/\\.json$/, '') })) }, null, 2) + '\\n');
+`;
+    try {
+      write(game.root, 'tools/packs.mjs', tool);
+      write(game.root, 'packs/README.md', 'pack folders live here\n');
+      write(game.root, 'public/i18n/en.json', JSON.stringify({ _meta: { type: 'lang', lang: 'en', name: 'English' } }));
+      const out = path.join(game.root, 'build', 'packs', 'www');
+      const r = assembleClient({ gameRoot: game.root, patchFile: game.patchFile, out, log: () => {} });
+      const file = path.join(out, 'packs', 'index.json');
+      assert.ok(existsSync(file), 'packs/index.json must be in the payload');
+      const idx = JSON.parse(readFileSync(file, 'utf8'));
+      assert.deepEqual(idx.packs.map((p) => `${p.type}:${p.id}`), ['lang:en'], 'the index describes the mirrored packs');
+      assert.ok(existsSync(path.join(out, 'packs', 'README.md')), 'packs/ is mirrored as a mount');
+      // the generated file is part of the payload, so the next run must not rewrite it nor sweep it away
+      const again = assembleClient({ gameRoot: game.root, patchFile: game.patchFile, out, log: () => {} });
+      assert.equal(again.copied, 0, 'an unchanged payload rewrites nothing (index included)');
+      assert.ok(existsSync(file), 'the sweep must not delete the pack index');
+    } finally {
+      rmSync(game.root, { recursive: true, force: true });
+      rmSync(path.dirname(game.patchFile), { recursive: true, force: true });
+    }
+  });
+
+  test('a checkout without the packs tool ships no index instead of a wrong one', () => {
+    const game = makeGameFixture();
+    try {
+      const out = path.join(game.root, 'build', 'nopacks', 'www');
+      const r = assembleClient({ gameRoot: game.root, patchFile: game.patchFile, out, log: () => {} });
+      assert.ok(!existsSync(path.join(out, 'packs', 'index.json')), 'no tools/packs.mjs → no index, no warning needed');
+      assert.equal(r.files > 0, true);
+    } finally {
+      rmSync(game.root, { recursive: true, force: true });
+      rmSync(path.dirname(game.patchFile), { recursive: true, force: true });
+    }
   });
 
   test('is incremental and drops payload files whose source is gone', () => {
@@ -313,9 +446,15 @@ describe('desktop packaging layout', () => {
     assert.deepEqual(desktopTargets({ portable: true }), ['portable']);
   });
 
-  test('electron-builder config agrees: folder target, trimmed locales, payload as resources/www', () => {
+  test('electron-builder config agrees: folder + portable + installer targets, trimmed locales, payload as resources/www', () => {
     const build = JSON.parse(readFileSync(path.join(ROOT, 'desktop', 'package.json'), 'utf8')).build;
-    assert.deepEqual(build.win.target, ['dir']);
+    // dir 是整包目录（zip 分发），portable 与 Setup 是玩家直接双击的单文件 —— build-clients.yml 的「校验产物」
+    // 按 *-portable.exe / *-Setup.exe 后缀找它们，所以下面两个 artifactName 必须和那里成对改。
+    assert.deepEqual(build.win.target, ['dir', 'portable', 'nsis']);
+    assert.equal(build.portable.artifactName, 'StrongholdProtocol-${version}-portable.exe');
+    assert.equal(build.nsis.artifactName, 'StrongholdProtocol-${version}-Setup.exe');
+    // 真 .msi 要 electron-builder 27（MsiTarget 只在 27.0.0-alpha 里），26.x 出不了 —— 升级前别在 CI 里加 msi target。
+    assert.equal(build.msi, undefined, 'msi 尚未启用：需要 electron-builder 27');
     // Electron ships ~48 locales (~48 MB); a Chinese/English game only needs these two.
     assert.deepEqual(build.electronLanguages, ['zh-CN', 'en-US']);
     assert.deepEqual(build.extraResources, [{ from: '../build/client/www', to: 'www' }]);
@@ -330,6 +469,26 @@ describe('desktop packaging layout', () => {
     assert.equal(parseCommonArgs(['--dir']).dir, true, '--dir is still accepted (it is the default now)');
     assert.throws(() => parseCommonArgs(['--nope']), /unknown option/);
   });
+});
+
+test('Electron asar includes every statically imported local module', () => {
+  const pkg = JSON.parse(readFileSync(path.join(ROOT, 'desktop', 'package.json'), 'utf8'));
+  const shipped = new Set(pkg.build.files.filter((f) => !f.startsWith('!')));
+  const pending = [pkg.main];
+  const seen = new Set();
+
+  while (pending.length) {
+    const rel = pending.shift();
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    assert.ok(shipped.has(rel), `desktop/${rel} is required by the Electron entry but missing from build.files (app.asar)`);
+    const file = path.join(ROOT, 'desktop', rel);
+    assert.ok(existsSync(file), `desktop/${rel} is included in build.files but does not exist`);
+    const source = readFileSync(file, 'utf8');
+    for (const match of source.matchAll(/^\s*(?:import|export)\s+[^\n;]*?\s+from\s+['"](\.[^'"]+)['"]/gm)) {
+      pending.push(path.posix.normalize(path.posix.join(path.posix.dirname(rel), match[1])));
+    }
+  }
 });
 
 describe('desktop shell: a stable loopback origin keeps localStorage', () => {
@@ -403,6 +562,20 @@ describe('desktop shell: a stable loopback origin keeps localStorage', () => {
       await new Promise((resolve) => blocker.server.close(resolve));
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test('a port the OS reserved (Windows answers EACCES) is skipped, not fatal — and the two shells agree', async () => {
+    // windows-latest 上实测到的：从被占的 50000 往后找，撞到 50001 直接抛 `listen EACCES`，而不是接着试 50002。
+    // Hyper-V / WSL2 / Docker 会把一整段动态端口留给系统（`netsh interface ipv4 show excludedportrange protocol=tcp`），
+    // bind 进去是 EACCES 而不是 EADDRINUSE —— 落在玩家机上就是"桌面版打不开"。行为的证据是那个作业本身变绿；
+    // 这里钉住的是判定集合：哪些错误算"这台机器上这个口不能用"，哪些仍然必须抛出来（不能把编程错误重试掉）。
+    const { PORT_SKIP_CODES } = await import('../desktop/serve.mjs');
+    assert.deepEqual([...PORT_SKIP_CODES].sort(), ['EACCES', 'EADDRINUSE', 'EPERM']);
+    assert.ok(!PORT_SKIP_CODES.has('ERR_INVALID_ARG'), 'a programming error must still throw, not be retried away');
+    const src = readFileSync(path.join(ROOT, 'desktop', 'serve.mjs'), 'utf8');
+    assert.match(src, /if \(!PORT_SKIP_CODES\.has\(e\?\.code\)\) throw e;/, 'the search loop must consult the set');
+    const rust = readFileSync(path.join(ROOT, 'tauri', 'src-tauri', 'src', 'server.rs'), 'utf8');
+    assert.match(rust, /Err\(_\) => continue,/, 'the Rust shell skips any unusable port inside its search window');
   });
 
   test('the weakest host model still serves the mirror: plain static, no alias, no rewrite (Capacitor does exactly this)', async () => {
@@ -750,8 +923,26 @@ describe('payload offline gate (no third-party host in the boot path)', () => {
         writeFileSync(path.join(root, 'webfonts', 'google', path.basename(u)), 'wOF2');
       }
     }
-    writeFileSync(path.join(root, 'data', 'assets.json'),
-      JSON.stringify(o.cdn ? { bgm: 'https://dl.lain42.top/site/assets/audio/x.mp3' } : { bgm: 'assets/audio/x.mp3' }));
+    // Art manifests and the files they promise. Three references, all satisfiable, because the point of this
+    // gate is that a broken reference is named (see artReferenceProblems): the case variant below is the one
+    // a Windows packaging machine cannot see with existsSync.
+    const ART_FILES = ['assets/char/avatar/c1.png', 'assets/char/portrait/c1_1.png', 'assets/local/map/board.png'];
+    writeFileSync(path.join(root, 'data', 'assets.json'), JSON.stringify(o.cdn
+      ? { chars: { c1: { avatar: '/assets/char/avatar/c1.png', portrait: '/assets/char/portrait/c1_1.png' } }, bgm: 'https://dl.lain42.top/site/assets/audio/x.mp3' }
+      : { chars: { c1: { avatar: '/assets/char/avatar/c1.png', portrait: '/assets/char/portrait/c1_1.png' } }, bgm: 'assets/audio/x.mp3' }));
+    writeFileSync(path.join(root, 'data', 'local-assets.json'),
+      JSON.stringify({ groups: { map: { board: { path: '/assets/local/map/board.png', w: 64, h: 64 } } } }));
+    if (!o.noArtManifest) {
+      for (const rel of ART_FILES) {
+        if (Array.isArray(o.dropArt) && o.dropArt.includes(rel)) continue;
+        const onDisk = (o.caseArt && o.caseArt[rel]) || rel;
+        mkdirSync(path.dirname(path.join(root, onDisk)), { recursive: true });
+        writeFileSync(path.join(root, onDisk), 'PNG');
+      }
+    } else {
+      rmSync(path.join(root, 'data', 'assets.json'), { force: true });
+      rmSync(path.join(root, 'data', 'local-assets.json'), { force: true });
+    }
     return root;
   };
   const cleanup = [];
@@ -786,6 +977,43 @@ describe('payload offline gate (no third-party host in the boot path)', () => {
   test('a payload without the mirror sheet fails', () => {
     const r = checkPayloadOffline(make({ dropSheet: true }));
     assert.match(r.problems.join('\n'), /缺自托管字体表/);
+  });
+
+  // The 立绘 question in one line: the shipped tree has to contain every file the art manifests name, compared
+  // case-exactly, because a packaged iOS app and the Linux web host both 404 on a name that only differs in case
+  // while the Windows machine that built them cannot see the difference. docs/IOS-ART.md.
+  test('the art manifests are counted, and a satisfied reference list is green', () => {
+    const r = checkPayloadOffline(make());
+    assert.equal(r.art.checked, 2, 'both manifests read');
+    assert.equal(r.art.refs, 3);
+    assert.deepEqual(r.problems, []);
+  });
+
+  test('a portrait named by the manifest but absent from the payload is called out', () => {
+    const r = checkPayloadOffline(make({ dropArt: ['assets/char/portrait/c1_1.png'] }));
+    const text = r.problems.join('\n');
+    assert.match(text, /data\/assets\.json: \d+ 个 URL 里 1 个在 payload 里找不到/);
+    assert.match(text, /assets\/char\/portrait\/c1_1\.png/);
+    assert.ok(!/只差大小写/.test(text), 'a plain absence is not reported as a case error');
+  });
+
+  test('a name that only differs in case is caught where existsSync is blind', () => {
+    const root = make({ caseArt: { 'assets/char/portrait/c1_1.png': 'assets/char/portrait/C1_1.png' } });
+    // Whether the wrong-case path opens here is a property of this filesystem, not of the check, so it is
+    // recorded rather than asserted — the part that must hold everywhere is that the gate names the case error.
+    const wrongCaseOpens = existsSync(path.join(root, 'assets', 'char', 'portrait', 'c1_1.png'));
+    console.log(`  本机文件系统${wrongCaseOpens ? '不分' : '分'}大小写：existsSync ${wrongCaseOpens ? '看不出' : '看得出'}这个错`);
+    const r = checkPayloadOffline(root);
+    const text = r.problems.join('\n');
+    assert.match(text, /其中 1 个只差大小写/);
+    assert.match(text, /清单要 assets\/char\/portrait\/c1_1\.png，盘上是 assets\/char\/portrait\/C1_1\.png/);
+  });
+
+  test('a tree without the art manifests is not held to them', () => {
+    const r = checkPayloadOffline(make({ noArtManifest: true }));
+    assert.equal(r.art.checked, 0);
+    assert.equal(r.art.refs, 0);
+    assert.ok(!r.problems.some((p) => /美术清单/.test(p)), JSON.stringify(r.problems));
   });
 
   test('a directory that is not a payload is refused, not silently passed', () => {
@@ -914,7 +1142,7 @@ describe('artifact-level offline gate (reads APK zip entries)', () => {
     const android = job('android');
     const ios = job('ios');
     assert.match(desktop, /check-payload-offline\.mjs build\/desktop\/win-unpacked\/resources\/www/, 'desktop: gate over the built exe');
-    assert.match(android, /check-payload-offline\.mjs --zip mobile\/android\/app\/build\/outputs\/apk\/debug\/app-debug\.apk/, 'android: gate over the built apk');
+    assert.match(android, /check-payload-offline\.mjs --zip mobile\/android\/app\/build\/outputs\/apk\/release\/app-release\.apk/, 'android: gate over the built apk');
     // iOS 的产物是一个目录包（.ipa 只是它的 zip 外壳），所以闸门直接扫 .app 里的 public/ —— 路径由那一步自己 find 出来。
     assert.match(ios, /check-payload-offline\.mjs "\$WWW"/, 'ios: gate over the built .app');
     for (const [name, src, build] of [['desktop', desktop, 'npm run pack'], ['android', android, 'gradlew'], ['ios', ios, 'xcodebuild']]) {
@@ -960,13 +1188,63 @@ describe('artifact-level offline gate (reads APK zip entries)', () => {
     }
   });
 
+  // 「与已安装应用签名不同(-7)」是玩家 2026-10-07 报上来的：这个工程原本一个 signingConfig 都没有，CI 跑的是
+  // assembleDebug，于是每个 runner 现场生成一把一次性 debug keystore —— Android 按签名证书决定能不能覆盖安装，
+  // 所以每次发版所有装机玩家都必须卸载重装（连同 localStorage 里的代号/调配/设置一起没）。
+  // 修法是固定一把 upload key，并把「这次和上次是不是同一把钥匙」变成 CI 的产物校验项。下面钉住这套约定。
+  test('the Android lane signs with one fixed upload key and proves it from the artifact', () => {
+    const wf = readFileSync(path.join(ROOT, '.github', 'workflows', 'build-clients.yml'), 'utf8');
+    const gradle = readFileSync(path.join(ROOT, 'mobile', 'android', 'app', 'build.gradle'), 'utf8');
+    const aStart = wf.indexOf('  android:');
+    assert.ok(aStart > 0, 'workflow 里要有 android job');
+    const aRest = wf.slice(aStart + 1);
+    const aNext = aRest.search(/^ {2}[a-z][\w-]*:$/m);
+    const android = aRest.slice(0, aNext === -1 ? aRest.length : aNext);
+
+    // 1) 出货的是 release，不是 debug。
+    assert.match(android, /gradlew\s+assembleRelease/, 'android job 必须打 release');
+    assert.ok(!/gradlew\s+assembleDebug/.test(android), 'android job 不该再出现 assembleDebug：debug 签的是 runner 的一次性钥匙');
+    assert.match(android, /path: mobile\/android\/app\/build\/outputs\/apk\/release\/app-release\.apk/, '上传的必须是 release 包');
+
+    // 2) 钥匙来自仓库 secret，而且这一步排在打包之前（secret 坏掉时一分钟就红，不是二十分钟后）。
+    assert.match(android, /secrets\.ANDROID_KEYSTORE_BASE64/, 'keystore 从仓库 secret 解出');
+    assert.match(android, /secrets\.ANDROID_KEYSTORE_PASSWORD/, '口令同样是 secret');
+    const prep = android.indexOf('准备固定签名钥匙');
+    assert.ok(prep > 0, '要有"准备固定签名钥匙"这一步');
+    assert.ok(prep < android.indexOf('assembleRelease'), '准备钥匙必须早于打包');
+
+    // 3) 同一把钥匙是**闸门**：apksigner 读产物里的证书，和仓库记录的指纹对拍，且必须在产物上传之前。
+    assert.match(android, /-name apksigner/, '用 SDK 自带的 apksigner 读证书');
+    assert.match(android, /verify --print-certs/, '要把证书指纹打印出来');
+    assert.match(android, /mobile\/android\/upload-key-sha256\.txt/, '与仓库记录的指纹对拍');
+    assert.ok(android.indexOf('APK 签名就是那一把钥匙') < android.indexOf('upload-artifact'), '签名闸门必须在上传产物之前');
+
+    // 4) 记录在册的指纹：CI 用 `tr -d ' \n\r'` 读它，所以这个文件里只容得下那一串（注释会把它污染成两次不匹配）。
+    const pin = readFileSync(path.join(ROOT, 'mobile', 'android', 'upload-key-sha256.txt'), 'utf8').trim();
+    assert.match(pin, /^[0-9a-f]{64}$/, `指纹得是 64 位小写十六进制，实为 ${JSON.stringify(pin)}`);
+
+    // 5) 私钥不出门：本仓库是 PUBLIC 的，keystore 一旦提交，任何人都能签出一个老玩家会自动接受的更新包。
+    const gi = readFileSync(path.join(ROOT, 'mobile', 'android', '.gitignore'), 'utf8');
+    assert.match(gi, /^keystore\.properties$/m, 'keystore.properties 必须 gitignore');
+    assert.match(gi, /^keystore\/$/m, 'keystore/ 目录必须 gitignore');
+
+    // 6) gradle 侧：缺钥匙时 release 必须失败。AGP 对没配签名的 release 的做法是**静默产出未签名 APK**，
+    //    那个包会一路走到玩家手机上才报错，比 CI 红一次难看得多。
+    assert.match(gradle, /signingConfigs\s*\{[\s\S]*?release\s*\{[\s\S]*?storeFile\s*=/, '要定义 release signingConfig');
+    assert.match(gradle, /signingConfig\s*=\s*signingConfigs\.release/, 'release buildType 必须真的用上它');
+    const thr = gradle.indexOf('throw new GradleException');
+    assert.ok(thr > 0, '缺钥匙时必须 throw');
+    assert.ok(thr < gradle.indexOf('android {'), '缺钥匙的检查要在配置阶段生效（写在 android{} 之前）');
+    assert.ok(gradle.includes('ANDROID_KEYSTORE_BASE64'), '报错文案要把 secret 名字写出来，CI 日志才自证');
+  });
+
   // 版本号的唯一真源是 package.json，四个地方要跟着它走（tools/package-release.mjs 的 alignVersions 负责写）。
   // iOS 那两个字段是这次加进来的：Xcode 模板写死 1.0 / 1，不钉住就会和 exe/apk 不同号，玩家报障对不上。
   test('every platform stamp agrees with package.json (and alignVersions is what keeps it that way)', () => {
     const v = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')).version;
     const code = versionCode(v);
     assert.ok(Number.isInteger(code) && code > 0, `versionCode(${v}) 应当派生出整数，实得 ${code}`);
-    for (const rel of ['package.json', 'desktop/package.json', 'mobile/package.json']) {
+    for (const rel of ['package.json', 'desktop/package.json', 'mobile/package.json', 'tauri/package.json']) {
       assert.equal(JSON.parse(readFileSync(path.join(ROOT, rel), 'utf8')).version, v, `${rel} 的版本与根不一致`);
     }
     const gradle = readFileSync(path.join(ROOT, 'mobile', 'android', 'app', 'build.gradle'), 'utf8');
@@ -977,6 +1255,12 @@ describe('artifact-level offline gate (reads APK zip entries)', () => {
     const build = [...pbx.matchAll(/\bCURRENT_PROJECT_VERSION = ([^;]+);/g)].map((m) => m[1]);
     assert.ok(marketing.length >= 2 && marketing.every((x) => x === v), `iOS MARKETING_VERSION 是 ${marketing.join('/')}，应为 ${v}（Debug 与 Release 都要）`);
     assert.ok(build.length >= 2 && build.every((x) => x === String(code)), `iOS CURRENT_PROJECT_VERSION 是 ${build.join('/')}，应为 ${code}`);
+    // Tauri 那一版还多两个字段（conf 与 Cargo.toml）。build-tauri.yml 的版本闸门拿 payload 的 game.app 比这三处，
+    // 少改一个就是"装出来的 exe 显示错版本"，所以它们必须和上面的六个文件同一次写全。
+    const conf = JSON.parse(readFileSync(path.join(ROOT, 'tauri', 'src-tauri', 'tauri.conf.json'), 'utf8'));
+    assert.equal(conf.version, v, 'tauri/src-tauri/tauri.conf.json 的版本与根不一致');
+    const cargo = readFileSync(path.join(ROOT, 'tauri', 'src-tauri', 'Cargo.toml'), 'utf8');
+    assert.match(cargo, new RegExp(`^version = "${v}"`, 'm'), `Cargo.toml 的 version 不是 ${v}`);
   });
 });
 
@@ -984,6 +1268,16 @@ describe('the artifact gate points where the packagers actually put the bytes', 
   // If these two derivations ever drift, the CI gate would either scan a nonexistent directory (loud, it exits 1)
   // or, worse, stop matching the real shipped layout. The mapping lives in the packager configs, not in the workflow.
   const wf = readFileSync(path.join(ROOT, '.github', 'workflows', 'build-clients.yml'), 'utf8');
+
+  test('the Electron entry-module gate checks app.asar after packing and before upload', () => {
+    const desktopJob = wf.slice(wf.indexOf('  desktop:'), wf.indexOf('  android:'));
+    const built = desktopJob.indexOf('- name: 打 Windows 目录版');
+    const checked = desktopJob.indexOf('- name: Electron 主进程模块（产物内，闸门）');
+    const uploaded = desktopJob.indexOf('name: stronghold-desktop-win');
+    assert.ok(built >= 0 && checked > built && uploaded > checked,
+      'Electron asar dependency gate must run after building the bytes and before uploading them');
+    assert.match(desktopJob.slice(checked, uploaded), /node tools\/check-electron-asar\.mjs build\/desktop\/win-unpacked\/resources\/app\.asar/);
+  });
 
   test('electron-builder ships the payload as extraResources named www next to the asar', () => {
     const b = JSON.parse(readFileSync(path.join(ROOT, 'desktop', 'package.json'), 'utf8')).build;
@@ -1066,19 +1360,21 @@ describe('the mirror check is case-exact, because Android filesystems are', () =
   });
 
   test('the directory mode is case-exact too (this is the one existsSync gets wrong)', () => {
-    // Windows: fs.existsSync('f0.woff2') is true when the file on disk is F0.woff2 — so a payload assembled on a
-    // windows-latest runner can pass an existsSync check and still 404 on a phone. readdirSync returns the stored
-    // casing, which is what the gate now compares against.
+    // Windows/macOS: `fs.existsSync('f0.woff2')` is TRUE when the file on disk is `F0.woff2` — so a payload
+    // assembled on a windows runner can pass an existsSync check and still 404 on a phone. Linux is
+    // case-sensitive, so the premise itself is a property of the machine, not of the gate: measure which one we
+    // are on and still require the gate to refuse the mismatch. Asserting the premise as a requirement is what
+    // made this test red on ubuntu-latest while green here.
     const root = mkdtempSync(path.join(tmpdir(), 'sp-casedir-'));
     mkdirSync(path.join(root, 'webfonts', 'google'), { recursive: true });
     writeFileSync(path.join(root, 'index.html'), '<link href="/webfonts/google/google.css">');
     writeFileSync(path.join(root, 'webfonts', 'google', 'google.css'), sheetTextFor(120));
     writeFileSync(path.join(root, 'webfonts', 'google', 'F0.woff2'), 'wOF2');
     for (let i = 1; i < 120; i++) writeFileSync(path.join(root, 'webfonts', 'google', `f${i}.woff2`), 'wOF2');
-    assert.ok(existsSync(path.join(root, 'webfonts', 'google', 'f0.woff2')), '前提：existsSync 对大小写不敏感（正因如此不能用它判）');
+    const insensitive = existsSync(path.join(root, 'webfonts', 'google', 'f0.woff2'));
     const r = checkPayloadOffline(root);
     const flat = r.problems.join('\n');
-    assert.match(flat, /个切片文件缺失/);
+    assert.match(flat, /个切片文件缺失/, `这台机器 existsSync 大小写不敏感=${insensitive}`);
     assert.match(flat, /只差大小写/, '要说出"只差大小写"，否则没人明白为什么算缺失');
   });
 

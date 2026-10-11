@@ -1,0 +1,249 @@
+name: build-tauri
+
+# 《卫戍协议：盟约》的 Tauri 壳：系统 WebView2，不再自带 Chromium。
+#
+# 为什么单独一条流水线而不是往 build-clients.yml 里加一步：这条要装 Rust 工具链、要跑 cargo test、
+# 产物名与形态也不同（目录版 + 安装器，**没有**单文件自解压版 —— 启动慢的实测主因就是每次启动解 974 MB 那个）。
+# payload 仍旧来自同一个 tar.gz（同一条 payload_url 输入），所以三条闸门与 Electron 那条完全一样：
+# 完整性 / expect_app / 出处 / 零外链，一条都不能少。
+#
+# 产物（stronghold-tauri-win）：
+#   StrongholdProtocolTauri-<ver>-setup.exe        NSIS 安装器（WebView2 已装的机器不会联网下载它）
+#   StrongholdProtocolTauri-<ver>-dir.zip          解压即用：exe + 同目录的 www/
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_url:
+        description: '客户端 payload 包（tar.gz，内含 index.html / js / assets / data …）'
+        required: true
+      server:
+        description: '校验用：payload 内 runtime-config.js 应当指向的服务器'
+        required: false
+        default: 'sp.lain42.top'
+      expect_app:
+        description: '闸门：payload 内 build.json 的 game.app 必须等于此值；留空则要求等于本仓库 package.json 的 version'
+        required: false
+        default: ''
+
+env:
+  NODE_VERSION: '22'
+  WWW_DIR: tauri/src-tauri/www
+
+jobs:
+  windows-tauri:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      # 缓存必须"失败也存"：前三次构建都死在 cargo test 上，若只在成功时保存，
+      # 每次都要从零重编 tauri 的依赖（release + fat LTO 一段就是好几分钟）。
+      # key 绑 Cargo.lock：依赖没变就命中，变了就重建，不会拿到半新半旧的 target/。
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tauri/src-tauri
+          cache-workspaces: tauri/src-tauri
+          save-always: true
+          key: payload-${{ hashFiles('tauri/src-tauri/Cargo.lock') }}
+
+      - name: 下载并解压 payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.payload_url }}"
+          echo "payload: $URL"
+          mkdir -p "$WWW_DIR"
+          curl -fL --retry 3 --retry-delay 3 "$URL" -o payload.tar.gz
+          ls -lh payload.tar.gz
+          tar -xzf payload.tar.gz -C "$WWW_DIR"
+          echo "解压文件数: $(find "$WWW_DIR" -type f | wc -l)"
+          du -sh "$WWW_DIR"
+
+      # 与 Electron 那条同一套闸门，因为出厂的是同一份 payload：少一个检查项就等于"能发但没人保证内容"。
+      - name: 校验 payload 完整性
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in index.html js/runtime-config.js js/shell/picker.js js/net.js dev/spine-probe.html dev/spine-probe.js; do
+            test -f "$WWW_DIR/$f" || { echo "缺 $f"; exit 1; }
+          done
+          ASSETS=$(find "$WWW_DIR/assets" -type f 2>/dev/null | wc -l)
+          echo "素材文件数: $ASSETS"
+          test "$ASSETS" -gt 3000 || { echo "素材不完整（只有 $ASSETS 个）"; exit 1; }
+          echo "--- build.json ---"
+          cat "$WWW_DIR/build.json"
+
+      - name: 校验 payload 版本（闸门）
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXPECT="${{ github.event.inputs.expect_app }}"
+          WANT_SERVER="${{ github.event.inputs.server }}"
+          REPO=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("package.json","utf8")).version)')
+          APP=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.WWW_DIR + "/build.json","utf8")).game.app)')
+          GOT_SERVER=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.WWW_DIR + "/build.json","utf8")).server)')
+          echo "payload: game.app=$APP server=$GOT_SERVER ；本仓库 version=$REPO"
+          if [ -n "$EXPECT" ]; then
+            [ "$APP" = "$EXPECT" ] || { echo "闸门：要求 expect_app=${EXPECT}，payload 实为 $APP"; exit 1; }
+          else
+            [ "$APP" = "$REPO" ] || { echo "闸门：payload 是 ${APP}，本仓库已对齐 $REPO"; exit 1; }
+          fi
+          if [ -n "$WANT_SERVER" ]; then
+            [ "$GOT_SERVER" = "$WANT_SERVER" ] || { echo "闸门：要求 server=${WANT_SERVER}，payload 实为 $GOT_SERVER"; exit 1; }
+          fi
+
+      - name: payload 出处（闸门）
+        shell: bash
+        run: node tools/check-payload-provenance.mjs "$WWW_DIR"
+
+      - name: 零外部依赖（闸门）
+        shell: bash
+        run: node tools/check-payload-offline.mjs "$WWW_DIR"
+
+      - name: 壳的版本必须跟着 payload（闸门）
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.env.WWW_DIR + "/build.json","utf8")).game.app)')
+          CONF=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("tauri/src-tauri/tauri.conf.json","utf8")).version)')
+          CARGO=$(node -e 'const s=require("fs").readFileSync("tauri/src-tauri/Cargo.toml","utf8");console.log(s.match(/^version = "([^"]+)"/m)[1])')
+          PKG=$(node -e 'console.log(JSON.parse(require("fs").readFileSync("tauri/package.json","utf8")).version)')
+          echo "payload=$APP conf=$CONF cargo=$CARGO npm=$PKG"
+          [ "$CONF" = "$APP" ] && [ "$CARGO" = "$APP" ] && [ "$PKG" = "$APP" ] || {
+            echo "闸门：Tauri 壳的版本（conf/Cargo/package.json）与 payload 的 game.app 不一致 —— 装出来的 exe 会显示错版本"; exit 1; }
+
+      - name: 图标（复用桌面壳那份，避免出现第二个真源）
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tauri/src-tauri/icons
+          cp desktop/icon.ico tauri/src-tauri/icons/icon.ico
+          test -s tauri/src-tauri/icons/icon.ico
+
+      # Rust 那份静态服务是 desktop/serve.mjs 的手抄，规则错了不会有人发现（只有声音没了、或者首屏白屏），
+      # 所以先跑单元测试，再跑仓库里的 JS/Rust 双表对齐测试，两边都必须绿才允许往下打包。
+      - name: cargo test（回环服务的规则）
+        shell: bash
+        run: cd tauri/src-tauri && cargo test --release -- --nocapture
+
+      - name: 两个壳的表必须一致（闸门）
+        shell: bash
+        run: node --test test/tauri-parity.test.js
+
+      - name: 装 @tauri-apps/cli
+        working-directory: tauri
+        run: npm install
+
+      - name: 打 Tauri Windows 包（NSIS 安装器）
+        working-directory: tauri
+        run: npx tauri build --bundles nsis
+
+      - name: 校验产物
+        shell: bash
+        run: |
+          set -euo pipefail
+          find tauri/src-tauri/target/release/bundle -type f \( -name '*.exe' -o -name '*.msi' \) -printf '%s %p\n' | sort -rn | head -10 || true
+          SETUP=$(find tauri/src-tauri/target/release/bundle -type f -name '*.exe' | head -1)
+          [ -n "$SETUP" ] || { echo "没有打出 NSIS 安装器"; ls -R tauri/src-tauri/target/release/bundle | head -40; exit 1; }
+          echo "installer: $SETUP"
+          ls -lh "$SETUP"
+          # 目录版：exe + 同目录的 www/，玩家解压即用，启动不再有任何自解压
+          mkdir -p out/StrongholdProtocolTauri
+          cp tauri/src-tauri/target/release/stronghold-protocol-tauri.exe out/StrongholdProtocolTauri/StrongholdProtocolTauri.exe
+          cp -r "$WWW_DIR" out/StrongholdProtocolTauri/www
+          test -s out/StrongholdProtocolTauri/StrongholdProtocolTauri.exe
+          test -f out/StrongholdProtocolTauri/www/index.html
+          du -sh out/StrongholdProtocolTauri
+
+      # 出厂字节的零外链闸门：装在目录版里那份 www（与安装器打进去的是同一棵树）。
+      - name: 零外部依赖（产物内，闸门）
+        shell: bash
+        run: node tools/check-payload-offline.mjs out/StrongholdProtocolTauri/www
+
+      # 启动耗时：壳自己数"页面把 js/main.js 取走"用了多少毫秒。这条不是给人看的画面，是给流水线的数字，
+      # 所以窗口先不抬起来。
+      #
+      # 这一条现在是**硬闸门**（以前是 continue-on-error，等于装饰）：release 壳去掉了控制台窗口
+      # （`windows_subsystem = "windows"`），日志与 boot_probe 全靠"继承来的 stdout 句柄"写进重定向文件。
+      # 那句实现一旦变（比如哪天改成写文件或不写），这里必须红，而不是让我们以为还有启动数字。
+      - name: 启动探针（boot_probe 毫秒数，闸门）
+        shell: pwsh
+        run: |
+          $env:SP_TAU_BOOT_PROBE = "1"
+          $env:SP_WWW = "out/StrongholdProtocolTauri/www"
+          $exe = "out/StrongholdProtocolTauri/StrongholdProtocolTauri.exe"
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput boot-probe.txt -RedirectStandardError boot-probe.err
+          if (-not $p.WaitForExit(90000)) { Stop-Process -Id $p.Id -Force; Write-Output "boot_probe: 90 秒没跑完" }
+          Get-Content boot-probe.txt, boot-probe.err -ErrorAction SilentlyContinue
+          $hit = Select-String -Path boot-probe.txt -Pattern 'boot_probe .*main_js_ms=\d+' -ErrorAction SilentlyContinue
+          if (-not $hit) {
+            Write-Output "闸门：boot-probe.txt 里没有 boot_probe 行"
+            Write-Output "  要么 runner 上没有可用的 WebView2（窗口建不起来，见上面 stderr），"
+            Write-Output "  要么壳的 stdout 不再流到重定向句柄（去掉控制台窗口的连带风险）。"
+            exit 1
+          }
+          Write-Output "启动探针 OK：$($hit.Line)"
+          # F11 全屏（任务 #64）：CI 里没有键盘，所以由壳自己去问真窗口切不切得动 —— 这条证明的是
+          # "命令通道 ↔ 窗口"那一段；"keydown → fetch"那一段由 test/picker.test.js 的源码钉与跨语言路由名
+          # 比对负责。缺行 = 壳不再报 = 红（和 boot_probe 同一个道理：只当装饰的日志等于没有）。
+          $fs = Select-String -Path boot-probe.txt -Pattern 'fullscreen_probe first=(\S+) second=(\S+)' -ErrorAction SilentlyContinue
+          if (-not $fs) {
+            Write-Output "闸门：boot-probe.txt 里没有 fullscreen_probe 行 —— 壳的命令通道没跑起来，或 stdout 又不流到重定向了"
+            exit 1
+          }
+          $fa = $fs.Matches[0].Groups[1].Value
+          $fb = $fs.Matches[0].Groups[2].Value
+          Write-Output "全屏通道：first=$fa second=$fb"
+          # pending / rejected / unavailable / no-window 都是"话没说到窗口那里"；on/off/error/unreadable 才是
+          # 窗口自己答的话（error 留着看得见，说明 Tauri 那层的调用变了 —— 那是另一个问题，不是这条通道坏了）。
+          foreach ($v in @($fa, $fb)) {
+            if ($v -match 'pending|rejected|unavailable|no-window|unknown') {
+              Write-Output "闸门：全屏返回 $v —— 命令没能排到主线程上"
+              exit 1
+            }
+          }
+          # 连接复用是这一版的优化本身，所以它也必须是道闸门：页面取了几十个文件，就必须只用几条 TCP 连接。
+          # 退回"一个连接一个请求"时这行仍然会打印出来，只看"有没有 boot_probe 行"是抓不住的。
+          $m = [regex]::Match($hit.Line, 'requests=(\d+) connections=(\d+)')
+          if (-not $m.Success) {
+            Write-Output "闸门：boot_probe 行里读不到 requests=/connections= —— 壳不再报这两个数了"
+            exit 1
+          }
+          $req = [int]$m.Groups[1].Value
+          $con = [int]$m.Groups[2].Value
+          Write-Output "连接复用：$req 个请求 / $con 条连接"
+          # 阈值留了两倍余量，而不是 con < req：浏览器会投机地多开几条空 socket（HTTP/1.1 每个源最多 6 条），
+          # 探针打印的那一刻可能"连接多、请求少"，用 con<req 会把好构建判死。
+          # 而退回"一个连接一个请求"时比值必然 1:1，这条照样红 —— 那才是它要防的东西。
+          if ($con * 2 -gt $req) {
+            Write-Output "闸门：$req 个请求用了 $con 条连接（平均每条不到 2 个）—— 连接复用退化或没生效"
+            exit 1
+          }
+
+      - name: 收齐两种形态
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem -Recurse tauri/src-tauri/target/release/bundle -Filter *.exe | Select-Object -First 1
+          $ver = node -e "console.log(JSON.parse(require('fs').readFileSync('tauri/src-tauri/tauri.conf.json','utf8')).version)"
+          Copy-Item $setup.FullName "StrongholdProtocolTauri-$ver-setup.exe"
+          Push-Location out
+          7z a -mx=9 "..\StrongholdProtocolTauri-$ver-dir.zip" StrongholdProtocolTauri
+          Pop-Location
+          Get-ChildItem "StrongholdProtocolTauri-$ver-setup.exe","StrongholdProtocolTauri-$ver-dir.zip" |
+            Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stronghold-tauri-win
+          path: |
+            StrongholdProtocolTauri-*-setup.exe
+            StrongholdProtocolTauri-*-dir.zip
+          retention-days: 7

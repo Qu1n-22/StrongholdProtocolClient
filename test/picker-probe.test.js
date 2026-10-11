@@ -38,7 +38,7 @@ const TIMEOUT = 40;
 /**
  * Script what the network answers for one test.
  * @param {{open?: string[], flaky?: string[], cors?: Record<string, object>, answered?: string[], hang?: boolean,
- *          healthDelay?: number}} w
+ *          healthDelay?: number, socketDelay?: Record<string, number>, hangingSockets?: string[]}} w
  *   `open` socket URLs whose handshake succeeds, `flaky` ones that only succeed on a second attempt,
  *   `cors` health URLs that return JSON with CORS headers, `answered` health URLs reachable without CORS
  *   headers, `hang` = health requests never settle at all, `healthDelay` = how long /healthz takes (a real one is
@@ -50,6 +50,8 @@ function scriptWorld(w = {}) {
   const cors = w.cors ?? {};
   const answered = new Set(w.answered ?? []);
   const delay = w.healthDelay ?? 0;
+  const socketDelay = w.socketDelay ?? {};
+  const hangingSockets = new Set(w.hangingSockets ?? []);
   const tried = { sockets: [], health: [] };
   const hits = new Map();
   // Lazy on purpose: a rejected promise created up front would sit unhandled until the timer attaches its handler.
@@ -64,6 +66,7 @@ function scriptWorld(w = {}) {
       const n = (hits.get(url) ?? 0) + 1;
       hits.set(url, n);
       this.readyState = 0;
+      if (hangingSockets.has(url)) return;
       setTimeout(() => {
         const works = open.has(url) && !(flaky.has(url) && n < 2);
         if (works) {
@@ -73,7 +76,7 @@ function scriptWorld(w = {}) {
           this.readyState = 3;
           this.onclose?.({ code: 1006 });
         }
-      }, 1);
+      }, socketDelay[url] ?? 1);
     }
 
     close() { this.readyState = 3; }
@@ -145,6 +148,22 @@ describe('the server probe', { skip: GAME_ROOT ? false : 'no Stronghold-Protocol
     ], 'a scheme-less host:port keeps its two-scheme guess');
   });
 
+  test('进入时交给游戏的地址永远挂在根 /ws —— 带路径就是玩家看到的 "Not Found"', () => {
+    // 实测 2026-10-07：十台网友服全部在根路径回 101，而三台带路径的种子地址在 `<path>/ws` 回 404
+    // （`server/index.js` 只对 rawPath === '/ws' 放行，其余 reject(404, 'Not Found')）。
+    // 探针会两个挂载都试，所以列表里那行可以显示「可连接」，而游戏只拿一个 URL —— 探针失败或沿用老
+    // localStorage 时，带路径的地址就直接进了 net.js，玩家那边就是一个光秃秃的 Not Found。
+    assert.equal(picker.bootUrlOf('https://game.misyra.com/play'), 'wss://game.misyra.com/ws');
+    assert.equal(picker.bootUrlOf('https://sp.rainya.me:10166/play'), 'wss://sp.rainya.me:10166/ws', '端口要留着');
+    assert.equal(picker.bootUrlOf('wss://host/ws'), 'wss://host/ws', '本来就是根挂载的不再动它');
+    assert.equal(picker.bootUrlOf('http://183.66.27.19:20522/'), 'ws://183.66.27.19:20522/ws', '去路径不能改判出来的协议');
+    assert.equal(picker.bootUrlOf('  '), '');
+    for (const e of COMMUNITY_SERVERS) {
+      assert.match(picker.bootUrlOf(e.address), /^wss?:\/\/[^/]+\/ws$/,
+        `播种地址 ${e.address} 归一化后不是根挂载`);
+    }
+  });
+
   test('it enters the server that answers, even when that is not the one typed', async () => {
     const { tried } = scriptWorld({ open: ['wss://host.example/ws'] });
     const r = await picker.probe('https://host.example/play', TIMEOUT);
@@ -152,6 +171,31 @@ describe('the server probe', { skip: GAME_ROOT ? false : 'no Stronghold-Protocol
     assert.equal(r.url, 'wss://host.example/ws', 'the game gets the socket URL that actually opened');
     assert.equal(r.hadPath, true);
     assert.deepEqual(tried.sockets.sort(), ['wss://host.example/play/ws', 'wss://host.example/ws'], 'both, in one round');
+  });
+
+  test('a working candidate returns before a slow losing mount times out', async () => {
+    const { tried } = scriptWorld({
+      open: ['wss://host.example/ws'],
+      hangingSockets: ['wss://host.example/play/ws'],
+    });
+    const started = Date.now();
+    const r = await picker.probe('https://host.example/play', 140);
+    assert.equal(r.ok, true);
+    assert.equal(r.url, 'wss://host.example/ws');
+    assert.ok(Date.now() - started < 100, 'working root WS should not wait for losing mount');
+    assert.equal(tried.sockets.length, 2);
+  });
+
+  test('a handshake timeout is inconclusive, not proof the host is offline', async () => {
+    scriptWorld({
+      hangingSockets: ['wss://host.example/ws'],
+      cors: { 'https://host.example/healthz': { app: '0.2.3' } },
+    });
+    const r = await picker.probe('https://host.example', 30, 1);
+    assert.equal(r.ok, false);
+    assert.equal(r.online, true);
+    assert.equal(r.timedOut, true);
+    assert.match(probeReason(r), /握手超时/);
   });
 
   test('a host that answers /healthz is reported as online even though /ws failed', async () => {
@@ -257,6 +301,23 @@ describe('the server probe', { skip: GAME_ROOT ? false : 'no Stronghold-Protocol
     assert.equal(store[K_SEED], String(SEED_VERSION), 'the batch marker is what stops a re-seed later');
     assert.deepEqual(list.map((e) => e.address), COMMUNITY_SERVERS.map((e) => e.address));
     assert.ok(list.every((e) => e.name), 'seeded rows need names, or the card shows a bare URL');
+  });
+
+  test('an install seeded with the v1 batch gets only the entries added since, and not a second copy', async () => {
+    // The point of bumping SEED_VERSION: a player who already received batch 1 must receive the new rows on the
+    // next launch, while everything they already has stays exactly as it is (same name, same position).
+    assert.ok(SEED_VERSION > 1, 'this lane needs a bumped batch marker to mean anything');
+    assert.ok(COMMUNITY_SERVERS.length > 5, 'the fixture assumes batch 1 was the first five entries');
+    const batch1 = COMMUNITY_SERVERS.slice(0, 5);
+    const mine = [{ name: '我自己填的 mistyra', address: batch1[0].address }, ...batch1.slice(1)];
+    const store = await launchWith({ [K_SEED]: '1', [K_LIST]: JSON.stringify(mine) });
+    const list = JSON.parse(store[K_LIST]);
+    assert.equal(store[K_SEED], String(SEED_VERSION), 'the marker moves to the new batch, or it will re-seed forever');
+    const added = list.filter((e) => !batch1.some((b) => b.address === e.address));
+    assert.deepEqual(added.map((e) => e.address), COMMUNITY_SERVERS.slice(5).map((e) => e.address),
+      'exactly the new fan servers arrive, nothing duplicated');
+    assert.equal(list[0].name, '我自己填的 mistyra', 'the player renamed it; seeding must not overwrite that');
+    assert.equal(list.length, batch1.length + COMMUNITY_SERVERS.length - 5);
   });
 
   test('a server the player deleted is not planted back on the next launch', async () => {

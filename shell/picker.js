@@ -25,11 +25,14 @@
 import { toHttpUrl, toWsUrl } from '../net.js';
 import {
   BUILTIN_SERVERS, COMMUNITY_SERVERS, K_AUTOSTART, K_CHOSEN, K_LIST, K_SEED, K_SERVER, NAME_MAX, SEED_VERSION,
-  addressError, ambiguousScheme, autostartOn, cleanName, customFrom, isAndroidUA, missingSeeds, orderCandidates,
-  pathOf, probeReason, serverName, shouldShowPicker,
+  addressError, ambiguousScheme, autostartOn, cleanName, customFrom, isAndroidUA, isFullscreenHotkey, isPickerHotkey, missingSeeds, orderCandidates,
+  pathOf, probeReason, rootWsUrl, serverName, shellFullscreenUrl, shouldShowPicker, forEachLimited,
 } from './picker-core.js';
 
-const PROBE_TIMEOUT_MS = 4000;
+// Cross-region mobile TLS handshakes sometimes need more than four seconds.
+const PROBE_TIMEOUT_MS = 6500;
+// Limit simultaneous host TLS/WebSocket handshakes when opening the server list.
+const MAX_SERVER_PROBES = 2;
 const isAndroid = () => isAndroidUA(globalThis.navigator?.userAgent);
 
 /**
@@ -69,6 +72,23 @@ function buildDefault() {
 
 /** Normalised socket URL of an address ('' → null). toWsUrl normalises rather than validates; addressError does that. */
 const keyOf = (address) => (typeof address === 'string' && address.trim() ? toWsUrl(address) : null);
+
+/**
+ * The socket URL the game boots with — a pasted path is dropped unless it already *is* the socket.
+ *
+ * `public/js/net.js` takes exactly one URL and never retries, and the game server rejects every other path:
+ * `server/index.js` answers the upgrade only for `rawPath === '/ws'` and `reject(404, 'Not Found')` otherwise.
+ * Measured 2026-10-07 on all ten seeded servers: root `/ws` → 101 on 10/10, while the three seeded addresses that
+ * carry a path (`https://game.misyra.com/play`, `https://game.rainya.me/play`, `https://sp.rainya.me:10166/play`)
+ * return **404** at `<path>/ws`. The picker probes both mounts, so its row can read 可连接 while the game —
+ * handed the typed address after a failed or skipped probe — shows the player a bare "Not Found".
+ */
+export const bootUrlOf = (address) => {
+  const s = typeof address === 'string' ? address.trim() : '';
+  if (!s) return '';
+  const ws = toWsUrl(s);
+  return ws ? rootWsUrl(ws) : s;
+};
 
 /** Escape interpolated text: /healthz comes from a remote server, so its fields are never trusted as markup. */
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -138,6 +158,8 @@ function probeOnce(wsUrl, timeoutMs) {
     let socket = null;
     let timer = null;
     let opened = false;
+    let handshakeFailed = false;
+    let timedOut = false;
     let settled = false;
     let healthDone = false;
     let failWait = false;
@@ -149,15 +171,15 @@ function probeOnce(wsUrl, timeoutMs) {
       settled = true;
       if (timer) clearTimeout(timer);
       try { socket?.close(); } catch { /* already closed */ }
-      resolve({ ok: opened, ms: Date.now() - started, info, online });
+      resolve({ ok: opened, ms: Date.now() - started, info, online, timedOut });
     };
 
     // A failed socket is only reported once /healthz has had its say: an instant 403/503 handshake would otherwise
     // always beat the fetch, and '对方在线，但 /ws 没通' is the part the player can act on.
-    const fail = () => { if (healthDone) finish(); else failWait = true; };
+    const fail = () => { handshakeFailed = true; if (healthDone) finish(); else failWait = true; };
     const healthSettled = () => { healthDone = true; if (failWait) finish(); };
 
-    timer = setTimeout(finish, timeoutMs);
+    timer = setTimeout(() => { timedOut = !opened && !handshakeFailed; finish(); }, timeoutMs);
 
     const health = `${httpUrlOf(wsUrl)}/healthz`;
     // Best effort, never blocking: /healthz usually has no CORS headers, and that is the server's business.
@@ -201,15 +223,34 @@ export async function probe(address, timeoutMs = PROBE_TIMEOUT_MS, attempts = 2)
   const candidates = candidateWsUrls(address);
   const hadPath = pathOf(address) !== '';
   if (!candidates.length) return { ok: false, ms: 0, online: false, hadPath };
-  const raced = await Promise.all(candidates.map(async (url) => ({ ...(await probeOnce(url, timeoutMs)), url })));
-  const good = raced.find((r) => r.ok);
+  // A single successful WebSocket proves reachability. Do not wait for a
+  // dead alternative mount to time out before reporting success.
+  const raced = new Array(candidates.length);
+  let remaining = candidates.length;
+  const good = await new Promise((resolve) => {
+    candidates.forEach((url, i) => {
+      void probeOnce(url, timeoutMs).then((r) => {
+        raced[i] = { ...r, url };
+        if (r.ok) resolve(raced[i]);
+        else if (--remaining === 0) resolve(null);
+      });
+    });
+  });
   if (good) return { ...good, hadPath };
+  const failed = raced.filter(Boolean);
   if (attempts > 1) {
     const again = { ...(await probeOnce(candidates[0], timeoutMs)), url: candidates[0] };
     if (again.ok) return { ...again, hadPath };
-    return { ok: false, ms: again.ms, info: again.info ?? raced.find((r) => r.info)?.info, online: again.online || raced.some((r) => r.online), hadPath };
+    return {
+      ok: false, ms: again.ms, info: again.info ?? failed.find((r) => r.info)?.info,
+      online: again.online || failed.some((r) => r.online), timedOut: again.timedOut || failed.some((r) => r.timedOut),
+      hadPath,
+    };
   }
-  return { ok: false, ms: Math.max(0, ...raced.map((r) => r.ms)), info: raced.find((r) => r.info)?.info, online: raced.some((r) => r.online), hadPath };
+  return {
+    ok: false, ms: Math.max(0, ...failed.map((r) => r.ms)), info: failed.find((r) => r.info)?.info,
+    online: failed.some((r) => r.online), timedOut: failed.some((r) => r.timedOut), hadPath,
+  };
 }
 
 const CSS = `
@@ -297,6 +338,7 @@ function mount() {
   let list = [];
   let selected = null;
   const states = new Map();
+  let refreshEpoch = 0;
 
   /** The stored entry behind a key, when it is a user-added (editable) server. */
   const customEntryOf = (key) => customServers().find((e) => toWsUrl(e.address) === key) || null;
@@ -333,6 +375,7 @@ function mount() {
           <div class="sp-pick__sub">STRONGHOLD PROTOCOL · MULTIPLAYER</div>
         </div>
         <div class="sp-pick__headbtns">
+          <button class="sp-pick__btn" id="sp-selftest" title="立绘或模型加载不上时，自检是哪一层（会离开当前连接）">立绘自检</button>
           <button class="sp-pick__btn" id="sp-refresh" title="重新测试各服务器延迟">刷新</button>
           <button class="sp-pick__btn" id="sp-back">返回</button>
         </div>
@@ -365,7 +408,8 @@ function mount() {
     for (const s of list) {
       const st = states.get(s.key) || {};
       const custom = customEntryOf(s.key) != null;
-      const state = st.pending ? '检测中…' : st.ok ? `可连接 · ${st.ms}ms` : st.failed ? '无法连接' : '';
+      const state = st.pending ? '检测中…' : st.ok ? `可连接 · 建连 ${st.ms}ms`
+        : st.failed ? (st.timedOut ? '探测超时 · 可重试' : st.online ? '主机在线 · WS 未通' : '暂时无法连接') : '';
       // The reason goes on the address line, which wraps; the status column stays one short word.
       const reason = st.pending || st.ok ? '' : probeReason(st);
       const info = st.info
@@ -399,24 +443,38 @@ function mount() {
     if (editEl) editEl.disabled = form !== null || !customEntryOf(selected);
   }
 
-  function refresh(entry) {
-    states.set(entry.key, { pending: true });
+  /** Probe at most two servers simultaneously and discard obsolete scan results. */
+  function queueRefreshAll() {
+    const epoch = ++refreshEpoch;
+    states.clear();
+    const entries = [...list];
+    if (selected) entries.sort((a, b) => Number(b.key === selected) - Number(a.key === selected));
+    for (const entry of entries) states.set(entry.key, { pending: true });
     renderList();
-    probe(entry.address).then((r) => {
-      states.set(entry.key, { ok: r.ok, ms: r.ms, info: r.info, failed: !r.ok, url: r.url, online: r.online, hadPath: r.hadPath });
+    void forEachLimited(entries, MAX_SERVER_PROBES, async (entry) => {
+      if (epoch !== refreshEpoch) return;
+      let result;
+      try {
+        result = await probe(entry.address);
+      } catch {
+        result = { ok: false, ms: 0, online: false, hadPath: pathOf(entry.address) !== '' };
+      }
+      if (epoch !== refreshEpoch) return;
+      states.set(entry.key, {
+        ok: result.ok, ms: result.ms, info: result.info, failed: !result.ok,
+        url: result.url, online: result.online, timedOut: result.timedOut, hadPath: result.hadPath,
+      });
       renderList();
-      if (!r.ok && entry.key === selected) {
-        setHint(`连不上 ${entry.http}${r.online ? '：对方在线，但没有游戏服务在 /ws 等待连接（可能已停机或没转发到游戏端口）。' : '：地址、端口或网络不通。'}确认服务器已启动，或换一个地址。`);
+      if (!result.ok && entry.key === selected) {
+        setHint(`检测 ${entry.http} 未成功：${probeReason(result) || '本次连接尝试失败'}。可稍后刷新，或直接尝试进入。`);
       }
     });
   }
 
-  /** 刷新: re-probe every listed server (the rows show 检测中… until each answers). */
+  /** Refresh without flooding all discovered servers with simultaneous sockets. */
   function refreshAll() {
-    setHint('正在重新测试各服务器延迟…');
-    states.clear();
-    renderList();
-    for (const s of list) refresh(s);
+    setHint('正在重新检测连接建立耗时（不是游戏内 RTT）…');
+    queueRefreshAll();
   }
 
   function loadList(keepKey) {
@@ -428,7 +486,7 @@ function mount() {
     if (!list.some((s) => s.key === selected)) selected = list[0]?.key ?? null;
     states.clear();
     renderList();
-    for (const s of list) refresh(s);
+    queueRefreshAll();
   }
 
   /**
@@ -440,13 +498,14 @@ function mount() {
     if (!entry?.address) return;
     // Prefer the URL that actually answered the probe: a typed `host:port` may only be reachable on one scheme.
     const st = entry.key ? states.get(entry.key) : null;
-    let address = (st?.ok && st.url) ? st.url : entry.address;
-    if (!st) {
-      // Direct connect: nothing has probed this address yet, so find the socket URL that works before going in.
+    let address = (st?.ok && st.url) ? st.url : bootUrlOf(entry.address);
+    if (!st?.ok) {
+      // Failed rows can be transient. Reprobe on join to detect the truly
+      // working WS scheme/mount instead of blindly using the guessed one.
       setHint(`正在连接 ${toHttpUrl(entry.address)} …`);
       const r = await probe(entry.address);
       if (r.ok && r.url) address = r.url;
-      else setHint(`连不上 ${toHttpUrl(entry.address)}：${probeReason(r) || '地址、端口或网络不通'}。仍然尝试进入，请稍候…`);
+      else setHint(`连不上 ${toHttpUrl(entry.address)}：${probeReason(r) || '本次连接尝试失败'}。仍然尝试进入，请稍候…`);
     }
     const key = keyOf(address);
     if (!key) return;
@@ -536,6 +595,10 @@ function mount() {
     } else {
       root.querySelector('#sp-back').addEventListener('click', () => { screen = 'home'; form = null; editingKey = null; setHint(''); layout(); });
       root.querySelector('#sp-refresh').addEventListener('click', refreshAll);
+      // 自检页是 payload 里的 `dev/spine-probe.html`（游戏仓），三端都发得出去；用绝对路径而不是拼 origin，
+      // 因为 Capacitor 的 origin 是 `capacitor://localhost` / `https://localhost`，桌面壳是 127.0.0.1 的某个端口。
+      // 这一步会离开当前连接，所以按钮标题里写明白了。
+      root.querySelector('#sp-selftest')?.addEventListener('click', () => { location.href = '/dev/spine-probe.html'; });
       root.querySelector('#sp-add').addEventListener('click', () => { const on = form !== 'add'; form = on ? 'add' : null; editingKey = null; setHint(''); renderForm(); });
       root.querySelector('#sp-direct').addEventListener('click', () => { const on = form !== 'direct'; form = on ? 'direct' : null; editingKey = null; setHint(''); renderForm(); });
       root.querySelector('#sp-edit').addEventListener('click', () => {
@@ -600,12 +663,15 @@ globalThis.__SP_SHELL_PICKER__ = {
   visible: pickerVisible,
   servers: serverList,
   candidates: candidateWsUrls,
+  bootUrlOf,
   probe,
 };
 
 // ---- launch decision --------------------------------------------------------------------------------------------
 const savedAddress = readItem(K_SERVER, 'localStorage');
-if (savedAddress) globalThis.__SP_SERVER__ = savedAddress;
+// 老版本可能把带路径的地址（`https://host/play`）原样存过 —— 那是玩家看到 "Not Found" 的另一条来路，
+// 所以进游戏前统一成根挂载的 socket URL。
+if (savedAddress) globalThis.__SP_SERVER__ = bootUrlOf(savedAddress) || savedAddress;
 /** The server the game is booting with: public/js/net.js reads __SP_SERVER__ when it opens the socket. */
 const bootTarget = keyOf(globalThis.__SP_SERVER__);
 
@@ -615,3 +681,36 @@ const autostart = autostartOn(readItem(K_AUTOSTART, 'localStorage'), isAndroid()
 // Seeding runs even when the overlay stays hidden: F2 has to find the same list a first launch would have shown.
 seedCommunityServers();
 if (shouldShowPicker({ forced, chosenThisSession, savedAddress, autostart })) showPicker();
+
+/**
+ * F2 = "换个服务器"，F11 = 全屏，都在页面里听。Electron 壳本来就在原生层拦了这两个（`desktop/main.mjs` 的
+ * `before-input-event` + `preventDefault()`），所以那边根本不会走到这一行；网页版两者都有浏览器自己的 F11；
+ * 而 **Tauri 壳没有任何原生快捷键** —— 玩家按 F11 什么都不会发生。放在这里就三端同一份实现。
+ * `showPicker()` 自身是幂等的（已经开着就什么都不做），所以即便哪天两个处理器同时收到也不会叠两层。
+ *
+ * 全屏只走壳，不走 `requestFullscreen()`：HTML5 全屏在 WebView2 里只铺满客户区，标题栏和任务栏都还在，
+ * 而 Electron 那边的 `setFullScreen()` 是真全屏 —— 两边按 F11 得到不同的东西比两边都没有更糟。壳这一侧是
+ * `tauri/src-tauri/src/server.rs` 的 `POST /__shell__/fullscreen`（同一个进程里的静态服务直接把动作递给窗口），
+ * 所以端口挪到哪个也一样能用，而且只开放这一个动作。
+ * `__SP_F11_STATE__` 是给 CI 的开动探针读的：这一串状态能分辨"根本没按键传来""页面不在壳里""命令发了但壳没答"
+ * 三种不同的"按了没反应"。
+ */
+globalThis.__SP_F11_STATE__ = 'idle';
+globalThis.addEventListener?.('keydown', (ev) => {
+  if (isFullscreenHotkey(ev.key, ev.repeat, ev)) {
+    const url = shellFullscreenUrl(globalThis.location?.hostname);
+    if (!url) {
+      globalThis.__SP_F11_STATE__ = 'no-shell';
+      return;
+    }
+    ev.preventDefault();
+    globalThis.__SP_F11_STATE__ = 'sending';
+    fetch(url, { method: 'POST', cache: 'no-store' })
+      .then((res) => { globalThis.__SP_F11_STATE__ = `sent:${res.status}`; })
+      .catch((e) => { globalThis.__SP_F11_STATE__ = `error:${(e && (e.message || String(e))) || '未知'}`.slice(0, 160); });
+    return;
+  }
+  if (!isPickerHotkey(ev.key, ev.repeat, ev)) return;
+  ev.preventDefault();
+  showPicker();
+});

@@ -1,0 +1,398 @@
+//! 《卫戍协议：盟约》的 Tauri 壳 —— 跑的是与 Electron 壳**同一份** payload，只是不再自带 Chromium。
+//!
+//! 为什么要这一个壳，只有两条玩家报的问题：包太大、启动太慢。目录版实测解包 1,145.4 MiB，其中 825.4 MiB 是
+//! payload 素材，剩下 **320.0 MiB 是 Electron 自带的运行时**；WebView2 是系统组件，于是这 320 MiB 换成十几 MB。
+//! 启动那条得说清楚：真正慢的是 `portable.exe` 每次启动都要自解压（实测它自己在临时目录里铺了 974 MB），
+//! 跟壳是哪个无关 —— 所以这个壳只出"目录 + 安装器"，不出单文件版。
+//!
+//! 关键设计：壳自己起一个**只监听 127.0.0.1:47821** 的静态服务器，窗口加载 `http://127.0.0.1:47821/` ——
+//! 与 Electron 壳同一个 origin。浏览器按 origin 划分 localStorage，博士代号、干员调配、设置、记住的服务器都在里面，
+//! 换成随机端口或 `tauri://localhost` 就会让人以为存档丢了。HTTP 细节在 `server.rs`，逐条对着
+//! `desktop/serve.mjs` 写，并由 `test/tauri-parity.test.js` 钉住两边不许漂移。
+
+// 发布版不许带控制台窗口。Rust 的二进制默认是 **console 子系统**，双击启动时 Windows 会先给开一个黑窗，
+// 里面是本壳的日志（2026-10-08 玩家真机报："启动有这个控制台，能去掉么"）。debug 构建保留，
+// `cargo tauri dev` 的日志还要看得见；release 下日志改由 `die()` 弹原生框（见那里）。
+#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
+mod server;
+
+use server::{ServeStats, ShellCommand};
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use tauri::Manager;
+
+/// 页面 → 壳的唯一一条命令通道（F11 全屏，见 `server::SHELL_FULLSCREEN_PATH`）。
+///
+/// 为什么是个槽而不是直接把 `AppHandle` 交给服务：端口就是 origin，静态服务必须**在窗口之前**绑好端口才能把
+/// 端口写进窗口地址；而 `AppHandle` 要到 `setup()` 才存在。填好之前收到的请求答 503，玩家那边看到的是
+/// `__SP_F11_STATE__ = 'sent:503'`，与"切成功了"的 `sent:200` 不是一回事。
+#[derive(Clone)]
+struct ShellSlot(Arc<Mutex<Option<tauri::AppHandle>>>);
+
+impl ShellSlot {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(None)))
+    }
+    fn fill(&self, handle: tauri::AppHandle) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = Some(handle);
+        }
+    }
+}
+
+impl ShellCommand for ShellSlot {
+    /// 窗口操作只能在事件循环那根线程上做，所以这里把动作递过去、再**等它回话**：
+    /// 答 `fullscreen=on|off` 而不是 `accepted`，页面与 CI 日志才分得清"命令排上了队"和"窗口真的变了"。
+    /// 等不到（主线程正忙）就回 pending —— 超时是上限，绝不会把这条连接挂死。
+    fn run(&self, cmd: &str) -> String {
+        if cmd != "fullscreen" {
+            return format!("unknown={cmd}");
+        }
+        // `run_on_main_thread(&self, ...)` borrows the handle while the closure needs to own one, so the closure
+        // gets its own clone — moving `handle` into the argument would be a borrow conflict (E0505).
+        let handle = match self.0.lock().ok().and_then(|g| (*g).clone()) {
+            Some(h) => h,
+            None => return "fullscreen=pending".to_string(),
+        };
+        let for_thread = handle.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if handle
+            .run_on_main_thread(move || {
+                let outcome = match for_thread.get_webview_window("main") {
+                    Some(w) => match w.is_fullscreen() {
+                        Ok(before) => {
+                            let want = !before;
+                            match w.set_fullscreen(want) {
+                                Ok(()) => if want { "on" } else { "off" },
+                                Err(_) => "error",
+                            }
+                        }
+                        Err(_) => "unreadable",
+                    },
+                    None => "no-window",
+                };
+                let _ = tx.send(outcome);
+            })
+            .is_err()
+        {
+            return "fullscreen=rejected".to_string();
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(o) => format!("fullscreen={o}"),
+            Err(_) => "fullscreen=pending".to_string(),
+        }
+    }
+}
+
+/// 认出"47821 上已经是我们自己的页面"的记号。
+const ORIGIN_MARKER: &str = "卫戍协议";
+/// 单实例的内核对象名。命名互斥量在进程结束时由内核释放（崩溃也算），所以不会留下"以为还开着"的僵尸锁。
+#[cfg(windows)]
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\StrongholdProtocolTauri.singleInstance";
+/// `GetLastError()` 的这个值表示"互斥量本来就在"，也就是已经有一个本客户端在跑。
+#[cfg(windows)]
+const ERROR_ALREADY_EXISTS: u32 = 183;
+
+fn main() {
+    if let Err(e) = run() {
+        die(&e.to_string());
+    }
+}
+
+/// 启动失败怎么让人看见。
+///
+/// release 版没有控制台了（见文件头的 `windows_subsystem`），双击启动的人看不见 `eprintln!` ——
+/// "点了没反应"比一个黑窗更难查。所以致命错误弹一个原生消息框，Electron 壳那边对应
+/// `dialog.showErrorBox`（`desktop/main.mjs`）。**探针模式下绝不弹**：CI 会被模态框挂住 90 秒然后超时，
+/// 而那一步要的是 stdout 上的 `boot_probe` 行。
+fn die(msg: &str) -> ! {
+    eprintln!("[tauri] {msg}");
+    popup(msg, MB_ICONERROR);
+    std::process::exit(1);
+}
+
+/// 不是故障、但必须解释一句的情况：已经有一个在跑了。
+///
+/// Electron 那边是 `app.requestSingleInstanceLock()` 失败就静默退出 + `second-instance` 把已有窗口抬到前面
+/// （`desktop/main.mjs:79/236`）。本壳认得出"已经有一个"（内核的命名互斥量 + 47821 的页面记号），但**抬不动**
+/// 另一个进程的窗口 —— 那需要一个进程间信号加一次主线程调用，而窗口在别的进程里。所以至少说清"已经开着了"：
+/// 双击完什么都没发生，玩家只会以为客户端坏了。
+fn notice(msg: &str) -> ! {
+    eprintln!("[tauri] {msg}");
+    popup(msg, MB_ICONINFORMATION);
+    std::process::exit(0);
+}
+
+const MB_ICONERROR: u32 = 0x0000_0010;
+const MB_ICONINFORMATION: u32 = 0x0000_0040;
+
+/// 探针模式（CI 的启动测量）下静默；其余情况在 Windows 上弹一个原生框。
+fn popup(msg: &str, icon: u32) {
+    #[cfg(windows)]
+    if std::env::var("SP_TAU_BOOT_PROBE").is_err() {
+        message_box(msg, icon);
+    }
+    #[cfg(not(windows))]
+    let _ = (msg, icon);
+}
+
+// 直接声明 `MessageBoxW`，不为此加一个 windows 绑定的 crate（`#[link]` 让链接器去找 user32.lib）。
+// extern 块放在模块顶层：`#[link]` 写在函数体里虽然通常也认，但没必要赌。
+// 这里是 `//` 而不是 `///`：rustdoc 不给 extern 块生成文档，`///` 只会多一条 unused_doc_comments 警告。
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(hwnd: *mut core::ffi::c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+}
+
+// 单实例用的是内核的命名互斥量，同样手写声明，不加 windows crate。
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateMutexW(attrs: *mut core::ffi::c_void, initial: i32, name: *const u16) -> *mut core::ffi::c_void;
+    fn GetLastError() -> u32;
+}
+
+/// 已经有一个本客户端在跑了？
+///
+/// 为什么不能只靠"47821 上是不是我们的页面"：那个探针看得见**已经在服务**的实例，看不见**正在启动**的实例
+/// —— 两次双击挤在一起时，第二个会以为自己抢到的是别的程序占的端口，退到 47822 开出一个新 origin，
+/// 玩家看到的就是一份空存档。互斥量在 CreateFile 那一刻就把"同一个程序"这件事钉住了，而且早于绑端口。
+/// 句柄故意不关：进程退出（含崩溃）时内核自己回收。
+#[cfg(windows)]
+fn already_running() -> bool {
+    let wide: Vec<u16> = SINGLE_INSTANCE_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 0, wide.as_ptr()) };
+    if handle.is_null() {
+        // 拿不到句柄说明不了"另一个实例在跑"，不能因此拒绝启动
+        return false;
+    }
+    // 整个比较放进 unsafe 块：`unsafe { f() } == X` 不是合法表达式（rustc 把 `unsafe {}` 当成语句，
+    // 于是报 expected expression, found `==`），第一次编译就是这么红的。
+    unsafe { GetLastError() == ERROR_ALREADY_EXISTS }
+}
+
+#[cfg(not(windows))]
+fn already_running() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn message_box(msg: &str, icon: u32) {
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let text = wide(msg);
+    let caption = wide("卫戍协议：盟约");
+    unsafe {
+        MessageBoxW(core::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), icon);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let www = locate_www()?;
+    if !www.join("index.html").is_file() {
+        return Err(format!("这个包是坏的：{} 不存在", www.join("index.html").display()).into());
+    }
+
+    // 单实例先看内核对象，再看端口：顺序很重要 —— 互斥量连"正在启动、还没开始服务"的那个实例也算得到，
+    // 而端口探针只看得见已经服务的。反过来（先探端口）会让两次挤在一起的双击里第二次退到 47822，
+    // 开出一个 origin 不同、看起来是空的存档。
+    if already_running() {
+        notice("已经有一个客户端在跑，不再开第二个。\n\n要看另一个服务器：在那个窗口里按 F2。");
+    }
+
+    // 端口已被占用时先分清占它的是"另一个我们"还是别人。前者必须退出：第二个实例会退到 47822 上开出一个全新
+    // origin，玩家看到的是代号、设置、调配全空 —— 那比启动慢更容易被当成存档丢了。
+    if occupied_by_us()? {
+        notice("已经有一个客户端在跑（47821 上就是本游戏的页面），不再开第二个。\n\n要看另一个服务器：在那个窗口里按 F2。");
+    }
+
+    let stats = Arc::new(ServeStats::default());
+    let shell = ShellSlot::new();
+    let (port, _thread) = server::spawn_server_with(www.clone(), Arc::clone(&stats), Some(Arc::new(shell.clone())))?;
+    // 端口挪走了就等于换了 origin，而 localStorage 是按 origin 存的：这件事必须说出来，不能让玩家自己发现"存档没了"。
+    if port != server::DEFAULT_PORT {
+        eprintln!("[tauri] 端口 {} 被占，改用 {port}", server::DEFAULT_PORT);
+        popup(
+            &format!(
+                "本地端口 {} 被别的程序占着，这次改用 {port}。\n\n\
+                 代号、编队、设置是按端口存的，所以这个窗口里它们会是空的；\n\
+                 把占端口的程序关掉再开客户端，原来那份就回来了。",
+                server::DEFAULT_PORT
+            ),
+            MB_ICONINFORMATION,
+        );
+    }
+    let url = format!("http://127.0.0.1:{port}/");
+    let probe = std::env::var("SP_TAU_BOOT_PROBE").is_ok();
+    println!("[tauri] 静态服务 port={port} root={}", www.display());
+
+    let probe_for_setup = probe;
+    let stats_for_setup = Arc::clone(&stats);
+    let url_for_setup = url.clone();
+    let shell_for_setup = shell;
+
+    let app = tauri::Builder::default()
+        .setup(move |app| {
+            // 窗口有了，才把 AppHandle 交给静态服务那条线：在此之前 `/__shell__/fullscreen` 答 503。
+            shell_for_setup.fill(app.handle().clone());
+            let parsed: tauri::Url = url_for_setup
+                .parse()
+                .map_err(|e| format!("窗口地址不合法 {url_for_setup}: {e}"))?;
+            let _win = tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::External(parsed))
+                .title("卫戍协议：盟约")
+                .inner_size(1440.0, 810.0)
+                .min_inner_size(960.0, 540.0)
+                .resizable(true)
+                // 探针模式下先别把窗口抬起来：我们要的是"页面自己的入口被取到没有"，不是给人看的画面
+                .visible(!probe_for_setup)
+                .build()
+                .map_err(|e| format!("窗口建不起来: {e}"))?;
+
+            if probe_for_setup {
+                let s = Arc::clone(&stats_for_setup);
+                let sh = shell_for_setup.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+                    while std::time::Instant::now() < deadline {
+                        let entry = s.entry_ms.load(Ordering::Relaxed);
+                        if entry > 0 {
+                            // CI 里没有键盘，所以这一段只问真窗口：命令通道 ↔ 真实窗口之间是这条流水线能证明的部分。
+                            // keydown → fetch 那一段由 test/picker.test.js 的源码钉加跨语言路由名比对负责。
+                            // 切两次：既看得见 on 也看得见 off，并且结束时回到原样。
+                            let first = sh.run("fullscreen");
+                            let second = sh.run("fullscreen");
+                            println!("fullscreen_probe first={first} second={second}");
+                            println!(
+                                "boot_probe first_request_ms={} main_js_ms={} requests={} connections={}",
+                                s.first_ms.load(Ordering::Relaxed),
+                                entry,
+                                s.requests.load(Ordering::Relaxed),
+                                s.connections.load(Ordering::Relaxed)
+                            );
+                            std::process::exit(0);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    println!(
+                        "boot_probe TIMEOUT requests={} connections={} first_request_ms={}",
+                        s.requests.load(Ordering::Relaxed),
+                        s.connections.load(Ordering::Relaxed),
+                        s.first_ms.load(Ordering::Relaxed)
+                    );
+                    std::process::exit(2);
+                });
+            }
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .map_err(|e| format!("壳起不来: {e}"))?;
+
+    app.run(|_handle, _event| {});
+    Ok(())
+}
+
+/// payload 在哪，最好的一批排前面：`$SP_WWW`（测试与"素材放在安装目录外"的机器）→ **已应用的更新**
+/// `<userData>/payload/current` → 安装目录里的 `www` → exe 旁边 → 开发用的 checkout。
+///
+/// 这条顺序与 `desktop/payload-path.mjs` 是同一个约定的两份实现（`test/tauri-parity.test.js` 钉着它）：
+/// "这一跑用的是哪份 payload" 必须由两个壳给同一个答案，否则自动更新会出现"Tauri 新版、Electron 旧版"
+/// 这种在同一个人电脑上并存的事。判"合格"要两个文件（`index.html` + `build.json`）而不是"目录存在"：
+/// 解了一半的更新包正好有前者没后者，那种目录服务起来是白屏。不合格的一律跳过、继续往下找 —— 更新坏了
+/// 不能让玩家连内置那份都玩不了。
+fn locate_www() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cands: [(&str, Option<PathBuf>); 6] = [
+        ("SP_WWW", std::env::var("SP_WWW").ok().map(PathBuf::from)),
+        ("已应用的更新", app_data_dir().map(|d| d.join("payload").join("current"))),
+        ("安装目录", Some(exe_dir.join("www"))),
+        ("安装目录(resources/www)", Some(exe_dir.join("resources").join("www"))),
+        ("开发 checkout", Some(PathBuf::from("src-tauri/www"))),
+        ("当前目录", Some(PathBuf::from("www"))),
+    ];
+    let (picked, skipped) = first_usable_payload(&cands);
+    let why = skipped.join(" | ");
+    if let Some(dir) = picked {
+        if !skipped.is_empty() {
+            eprintln!("[tauri] 跳过的候选：{why}");
+        }
+        return Ok(dir);
+    }
+    Err(format!(
+        "找不到 payload 目录 www/ —— 构建时必须把 payload 解到 src-tauri/www 并当资源打进包里。{}",
+        if why.is_empty() { String::new() } else { format!("（试过的都不合格：{why}）") }
+    )
+    .into())
+}
+
+/// 第一个合格的目录，外加"哪些候选因为什么被跳过"。跳过的一定要能说出来：玩家报"更新没生效"时，
+/// 这句就是答案（而不是"它默默用了内置那份"）。
+fn first_usable_payload(cands: &[(&str, Option<PathBuf>)]) -> (Option<PathBuf>, Vec<String>) {
+    let mut skipped: Vec<String> = Vec::new();
+    for (label, dir) in cands {
+        let Some(dir) = dir else { continue };
+        match payload_problem(dir) {
+            None => return (Some(dir.clone()), skipped),
+            Some(why) => skipped.push(format!("{label}（{}）：{why}", dir.display())),
+        }
+    }
+    (None, skipped)
+}
+
+/// 一份目录为什么不算 payload。`None` = 合格。
+fn payload_problem(dir: &std::path::Path) -> Option<String> {
+    if !dir.join("index.html").is_file() {
+        return Some("缺 index.html".into());
+    }
+    if !dir.join("build.json").is_file() {
+        return Some("缺 build.json（这个目录不是 payload 根，或解包解了一半）".into());
+    }
+    None
+}
+
+/// 壳自己的数据目录：Windows `%APPDATA%\<identifier>`，macOS `~/Library/Application Support/<identifier>`，
+/// Linux `$XDG_DATA_HOME` 或 `~/.local/share` 下面。`<identifier>` 必须与 `tauri.conf.json` 的 identifier
+/// 一致（Tauri 自己就是这么算的），否则写进去的更新下次启动就找不着了。
+const APP_DATA_NAME: &str = "top.lain42.strongholdprotocol.tauri";
+
+fn app_data_dir() -> Option<PathBuf> {
+    let root = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        home_dir().map(|h| h.join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir().map(|h| h.join(".local/share")))
+    }?;
+    Some(root.join(APP_DATA_NAME))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// 47821 已经被人占用了，而且占它的就是本游戏的页面？
+fn occupied_by_us() -> Result<bool, Box<dyn std::error::Error>> {
+    let mut sock = match std::net::TcpStream::connect(("127.0.0.1", server::DEFAULT_PORT)) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    sock.set_read_timeout(Some(std::time::Duration::from_millis(800)))?;
+    sock.set_write_timeout(Some(std::time::Duration::from_millis(800)))?;
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")?;
+    let mut buf = Vec::with_capacity(8192);
+    let _ = sock.read_to_end(&mut buf);
+    Ok(String::from_utf8_lossy(&buf).contains(ORIGIN_MARKER))
+}

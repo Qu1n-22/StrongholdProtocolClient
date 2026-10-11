@@ -1,0 +1,233 @@
+name: publish-client
+
+# 把两条产物流水线已经编好的东西收成一个玩家 Release —— 收口在 runner 上，不从本机过一遍。
+#
+# 为什么要这条 lane：c28 那次是我在本机 `gh run download` 三个 artifact（约 3.8 GB）再逐个
+# `gh release upload`。规矩改了之后（只有 GitHub Actions 可以编译与运行），把 3.8 GB 从 GitHub 拉到玩家
+# 自己的笔记本上再传回 GitHub 就成了纯粹的中转损耗：那次还差点把磁盘写满。artifact 与 Release 资产都在
+# 同一个仓的对象存储里，runner 内部搬一趟既不花钱也不过本机。
+#
+# 输入是两条已完成流水线的 run id：产物必须来自**已经绿过的那次构建**，这里不重新编译任何东西，只做搬运与核对。
+#
+# 闸门：
+#   1) tag 已存在就失败 —— 绝不覆盖已发布的资产（这是不可逆的那一侧）；
+#   2) 每个 artifact 解出来的文件名与数量都要对上（少一个就是半份客户端；c28 的教训是"F11 要新壳 + 新内置资源
+#      两边都齐"，所以六个形态必须同在一个 Release）；
+#   3) 逐个上传、逐个核对 sha256 与 size（一次性传六个大文件时被外层超时杀过，留下 tag 已写、assets=0 的半成品）；
+#   4) 发布后逐个 URL 真 HEAD 一遍：只查资产列表看不出某一条腿是 404（实测过一次）。
+#
+# 默认只建 Draft。核对过再 `--draft=false`（那一步才建 git tag）。
+# build-clients 那条 `push: tags: v*` 老触发已经删掉了，原因写在那个文件里 —— 否则发布这一步会顺手再点一跑
+# 用默认（已 403 的）OSS 地址的构建，看着像"发了版还多验了一次"，其实验的是另一份东西。
+
+on:
+  workflow_dispatch:
+    inputs:
+      clients_run:
+        description: 'build-clients 那次绿过的 run id（exe / apk / ipa）'
+        required: true
+      tauri_run:
+        description: 'build-tauri 那次绿过的 run id（安装器）'
+        required: true
+      tag:
+        description: '要建的 Release tag，例如 v0.2.2-c30（必须还不存在）'
+        required: true
+      title:
+        description: 'Release 标题'
+        required: false
+        default: '卫戍协议：盟约 · 客户端'
+      notes_file:
+        description: 'Release 正文（Markdown，多行）'
+        required: false
+        default: |
+          内核：游戏 0.2.2。
+          六个形态在同一个 Release：Windows 便携版与安装版、Android apk、iPhone 未签名 ipa、Tauri 安装器、桌面 zip。
+      as_draft:
+        description: 'yes=建 Draft（玩家看不到）/ no=直接发布'
+        required: false
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      # `gh run download` 取的是 actions 的对象存储：默认 token 只有 contents:read，
+      # 加了 contents: write 之后这一步不再自动带上 actions:read —— 少了它就是一条看不出来的 403。
+      actions: read
+    steps:
+      - name: tag 必须还不存在
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$TAG 已经是 Release 了 —— 已发布的资产不改写、不覆盖。换 tag，或者由人来决定撤销。"
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "git tag $TAG 已存在但没有 Release（多半是上一次建到一半）。先人工确认再动。"
+            exit 1
+          fi
+
+      - name: 取两条流水线的 artifact（runner 内部搬运）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for pair in "${{ inputs.clients_run }}:stronghold-desktop-win" \
+                      "${{ inputs.clients_run }}:stronghold-android-apk" \
+                      "${{ inputs.clients_run }}:stronghold-ios-ipa" \
+                      "${{ inputs.tauri_run }}:stronghold-tauri-win"; do
+            run="${pair%%:*}"; name="${pair##*:}"
+            # 每个 artifact 单独下：`gh run download` 不带 -n 会把几个 artifact 摊平到同一层，
+            # 于是"哪个文件来自哪条流水线"这条线索就没了。
+            # -R 是必需的：这条 lane 没有 checkout 步骤，工作目录不是 git 仓库，
+            # `gh run download` 会先跑 `git rev-parse` 推断仓库然后直接死在 "not a git repository"（实测）。
+            echo "--- $name (run $run)"
+            gh run download "$run" -n "$name" -D "out/$name" -R "$GITHUB_REPOSITORY"
+            find "out/$name" -maxdepth 1 -type f -printf '%f\t%s B\n'
+          done
+          echo "共 $(find out -type f | wc -l) 个文件，$(du -sh out | cut -f1)"
+
+      - name: 改成玩家看到的文件名，再核对数量与形态（半份客户端不发）
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          # artifact 里是构建工具的默认名（gradle 的 `app-release.apk`、xcode 的 `Stronghold-ios-unsigned.ipa`），
+          # 而玩家报障时说的是包名。c28 那批带版本与刀号的名字是在本机改名上传的；这条 lane 要自己会改，
+          # 否则发出去的 Release 里会出现两个同名不同代的 `app-release.apk`，没人分得清哪份是哪个内核。
+          NAMEVER="${TAG#v}"          # v0.2.2-c32 -> 0.2.2-c32
+          rename_to() { # glob  → 新名
+            local pat="$1" to="$2" f
+            while IFS= read -r f; do [ -n "$f" ] || continue; mv "$f" "$(dirname "$f")/$to"; echo "改名 -> $to"; done \
+              < <(find out -type f -name "$pat" | head -1)
+          }
+          rename_to 'app-release.apk' "Stronghold-${NAMEVER}-android-release.apk"
+          rename_to 'Stronghold-ios-unsigned.ipa' "Stronghold-${NAMEVER}-ios-unsigned.ipa"
+          rename_to 'StrongholdProtocol-desktop.zip' "StrongholdProtocol-desktop-win-${NAMEVER}.zip"
+          rename_to 'StrongholdProtocolTauri-*-setup.exe' "StrongholdProtocolTauri-${NAMEVER}-setup.exe"
+          # Electron 那两个产物由 electron-builder 的 artifactName 命名（含版本不含刀号），与 c28 一致，不动。
+          # Tauri 的 -dir.zip 是解开的整棵树（~600 MB，调试/取证用）。玩家版从 c28 起就没带过它：
+          # 六个形态各一条 URL 才是玩家看得懂的东西，多塞一个 600 MB 只会让"我该下哪个"变成问题。
+          find out -type f -name '*Tauri*-dir.zip' -printf '跳过（不发给玩家）%P\n' -delete
+
+          n=$(find out -type f | wc -l)
+          echo "拿到 $n 个文件"
+          find out -type f -printf '%p\t%s B\n' | sort
+          test "$n" -ge 6 || { echo "预期至少 6 个文件，实得 $n —— 缺的就是玩家装不上的那一半"; exit 1; }
+          # 大文件不许"安静地是空的"：小于 1 MB 的一定不是产物本体。
+          small=$(find out -type f -size -1M -printf '%p %s\n' | head)
+          if [ -n "$small" ]; then echo "这些文件小得不像产物：$small"; exit 1; fi
+          # 数量够不等于形态齐：按**最终文件名**核对六个形态，缺哪个就是哪一类玩家装不上。
+          missing=""
+          for pat in "Stronghold-${NAMEVER}-android-release\\.apk$" "Stronghold-${NAMEVER}-ios-unsigned\\.ipa$" \
+                     "StrongholdProtocolTauri-${NAMEVER}-setup\\.exe$" "StrongholdProtocol-desktop-win-${NAMEVER}\\.zip$" \
+                     'StrongholdProtocol-.*-portable\.exe$' 'StrongholdProtocol-.*-Setup\.exe$'; do
+            find out -type f | grep -qE "$pat" || missing="$missing $pat"
+          done
+          if [ -n "$missing" ]; then echo "缺这些形态：$missing"; find out -type f | sort; exit 1; fi
+
+      - name: 逐个上传并核对（默认 Draft）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          DRAFT: ${{ inputs.as_draft }}
+        run: |
+          set -euo pipefail
+          NOTES=/tmp/notes.md
+          cat > "$NOTES" <<'NOTES_EOF'
+          ${{ inputs.notes_file }}
+          NOTES_EOF
+          # 本地 sha256 先记下来，传完后**逐条与 GitHub 报的 digest 比** —— 只算不比等于没算（这一版原先
+          # 就是这么写的：注释说"传完再对一遍"，代码里没有那一步。注释比代码强是我最常犯的一类错）。
+          mapfile -t FILES < <(find out -type f | sort)
+          for f in "${FILES[@]}"; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")"; done > /tmp/local.sha256
+          cat /tmp/local.sha256
+          # 先只建 Release（--draft），再一个一个传：一次传六个大文件被外层超时杀过，
+          # 那次的结果是 tag_name 已经写进 Release、assets 却是 0，`gh release view <tag>` 反而查得到。
+          gh release create "$TAG" --draft --title "${{ inputs.title }} $TAG" --notes-file "$NOTES" -R "$GITHUB_REPOSITORY"
+          for f in "${FILES[@]}"; do
+            echo "--- 传 $(basename "$f")"
+            gh release upload "$TAG" "$f" --clobber -R "$GITHUB_REPOSITORY"
+          done
+          if [ "$DRAFT" = 'no' ]; then
+            gh release edit "$TAG" --draft=false -R "$GITHUB_REPOSITORY"
+          fi
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft,assets \
+            --jq '{isDraft,assets:[.assets[]|{name,size,digest}]}'
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | "\(.digest | sub("^sha256:"; "")) \(.name)"' | sort > /tmp/remote.sha256
+          bad=0
+          while read -r hex name; do
+            want=$(awk -v n="$name" '$2==n {print $1; exit}' /tmp/remote.sha256)
+            if [ "$want" != "$hex" ]; then echo "digest 不符：$name 本地=$hex GitHub=${want:-没有这个资产}"; bad=$((bad+1)); fi
+          done < /tmp/local.sha256
+          extra=$(awk 'NR==FNR{a[$2]=1;next} !($2 in a){print $2}' /tmp/local.sha256 /tmp/remote.sha256)
+          if [ -n "$extra" ]; then echo "Release 里有本地没有的资产：$extra"; bad=$((bad+1)); fi
+          test "$bad" = 0 || { echo "核对失败：每个资产的 sha256 都要与本地一致，且一条不多一条不少"; exit 1; }
+          echo "✓ ${#FILES[@]} 个资产的 sha256 与 GitHub 报的逐条一致"
+
+      - name: 验收资产（Draft 认证 REST，正式版匿名 URL）
+        env:
+          # 这一步没有 checkout，而 `gh release view` 需要 token —— 上一版漏了它，整步死在
+          # "To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN"（资产其实已经传完了）。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          # 只看资产列表看不出某一条腿是 404：c2* 那次就有一条 URL 静默 404，列表里它照样在。
+          # 取法要用 release id，不能用 `releases/tags/$TAG`：那个端点**看不见 Draft**（实测 2026-10-10，
+          # 资产已经全部传完、digest 也逐条对过了，这一步却自己 404 —— draft 模式下它必红，等于这条闸门
+          # 只在"直接发布"那一种用法下被跑过）。`gh release view` 两种模式都看得见，先拿它的 id。
+          REL_ID=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json databaseId --jq .databaseId)
+          test -n "$REL_ID" || { echo "拿不到 $TAG 的 release id"; exit 1; }
+          echo "release $REL_ID（draft 与否由下一步的取法决定）"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$REL_ID/assets" \
+            --jq '.[] | "\(.name)\t\(.browser_download_url)"' > /tmp/urls.tsv
+          total=$(wc -l < /tmp/urls.tsv)
+          test "$total" -ge 6 || { echo "Release 里只有 $total 条资产，少于六个形态"; exit 1; }
+          if [ "${{ inputs.as_draft }}" = 'yes' ]; then
+            # GitHub Draft 的 browser_download_url 即使带 Bearer token 也可能返回 404。
+            # 不以 Draft 下载 URL 判定资产缺失；上一步已比对真实 SHA-256。
+            # Draft 使用受权 REST Asset API 验证，正式发布后才验匿名 URL。
+            gh api "repos/$GITHUB_REPOSITORY/releases/$REL_ID/assets" \
+              --jq '.[] | "\(.id)\t\(.name)\t\(.size)\t\(.digest)"' > /tmp/draft-assets.tsv
+            checked=0
+            while IFS=$'\t' read -r id name size digest; do
+              test "$size" -gt 1000000 || { echo "Draft 资产体积异常：$name"; exit 1; }
+              case "$digest" in
+                sha256:*) test "${#digest}" -eq 71 || { echo "Draft 摘要格式异常：$name"; exit 1; };;
+                *) echo "Draft 资产缺摘要：$name"; exit 1;;
+              esac
+              actual=$(gh api "repos/$GITHUB_REPOSITORY/releases/assets/$id" \
+                --jq '"\(.name)\t\(.size)\t\(.digest)"')
+              expect=$(printf '%s\t%s\t%s' "$name" "$size" "$digest")
+              test "$actual" = "$expect" || { echo "Draft 资产详情不一致：$name"; exit 1; }
+              echo "REST API OK (Draft): $name ($size bytes)"
+              checked=$((checked + 1))
+            done < /tmp/draft-assets.tsv
+            test "$checked" -eq "$total" || { echo "Draft 数量不符：$checked != $total"; exit 1; }
+            echo "Draft：$checked 条资产 REST 元数据有效；发布后仍须匿名下载验收。"
+            exit 0
+          fi
+          ok=0
+          while IFS=$'\t' read -r name url; do
+            code=$(curl -sIL -o /dev/null -w '%{http_code}' "$url")
+            echo "HTTP $code  $name  $url"
+            if [ "$code" = '200' ]; then ok=$((ok+1)); else echo "  ↑ 这一条取不到"; fi
+          done < /tmp/urls.tsv
+          echo "可匿名下载：$ok/$total"
+          test "$ok" -eq "$total" || { echo "有资产取不到 —— 这个 Release 还不算发出去"; exit 1; }
