@@ -340,6 +340,15 @@ function mount() {
   const states = new Map();
   let refreshEpoch = 0;
 
+  /** Peers heard through the decentralized lobby, as picker entries. Never persisted — see loadList(). */
+  let discovered = [];
+  let discoveredKeys = '';
+  let lobby = null;
+  let lobbyStarted = false;
+  let publishedKey = null;
+  /** `rooms.js`'s withDiscovered(), available only once the lobby has loaded — see startLobby(). */
+  let foldDiscovered = null;
+
   /** The stored entry behind a key, when it is a user-added (editable) server. */
   const customEntryOf = (key) => customServers().find((e) => toWsUrl(e.address) === key) || null;
 
@@ -398,6 +407,58 @@ function mount() {
     if (el) el.textContent = hintText;
   }
 
+  /**
+   * Advertise where this player can be reached — the server they currently have selected. Guarded on the key because
+   * this is called from renderList(), which runs on every probe result: the lobby only needs to hear about a
+   * *change*, and re-broadcasting on each repaint would keep the relays busy for nothing.
+   */
+  function publishSelf() {
+    if (!lobby) return;
+    const entry = list.find((s) => s.key === selected) || list[0];
+    const key = entry?.key ?? null;
+    if (key === publishedKey) return;
+    publishedKey = key;
+    try {
+      lobby.publish({ name: entry?.label ?? '', address: entry?.address ?? '' });
+    } catch {
+      // A lobby that cannot publish is a lobby with nothing to say. It must never be a reason the picker breaks.
+    }
+  }
+
+  /**
+   * Open the decentralized lobby (`agents/p2p-match/agent.md` M1) and fold what it hears into the list.
+   *
+   * Every failure path returns silently: with no relay reachable this has to be indistinguishable from a build that
+   * has no lobby at all. A3 in that file is 「匹配过程对现有玩家零影响」, and the only way to keep that promise is to
+   * treat the whole feature as a hint. `globalThis.__SP_P2P__ = false` is the off switch.
+   */
+  async function startLobby() {
+    if (lobbyStarted || globalThis.__SP_P2P__ === false) return;
+    lobbyStarted = true;
+    try {
+      // Dynamic on purpose: link.js keeps the 75 kB Trystero bundle behind its own import(), and the picker runs
+      // before the game boots — a launch that never opens the lobby must pay nothing for it. rooms.js comes along
+      // because its list rule (withDiscovered) is only meaningful once there is something to fold in.
+      const [{ openLobby }, rooms] = await Promise.all([import('./p2p/link.js'), import('./p2p/rooms.js')]);
+      foldDiscovered = rooms.withDiscovered;
+      lobby = await openLobby();
+    } catch {
+      return;
+    }
+    lobby.subscribe((state) => {
+      // Keep the advert shape exactly as link.js/rooms.js produce it (`{ key, address, name, at }`): withDiscovered
+      // reads `name`, and `key` is already the root-mounted form the de-dup needs. Re-projecting it into the
+      // picker's own { label } shape here would silently drop the peer's advertised name.
+      discovered = state.rooms;
+      // The sweep fires every 10 s and again on every advert; only a *change* in who is around may restart the scan.
+      const keys = discovered.map((d) => d.key).filter(Boolean).sort().join(' ');
+      if (keys === discoveredKeys) return;
+      discoveredKeys = keys;
+      loadList(selected);
+    });
+    publishSelf();
+  }
+
   /** Repaint the server list onto the current (multi) screen. */
   function renderList() {
     const listEl = root.querySelector('#sp-list');
@@ -441,6 +502,8 @@ function mount() {
     if (goEl) goEl.disabled = !selected;
     // Only a user-added server can be edited (the built-in and the packaged default are fixed).
     if (editEl) editEl.disabled = form !== null || !customEntryOf(selected);
+    // Keep the lobby's advert in step with the selection. Guarded inside, so a repaint does not re-broadcast.
+    publishSelf();
   }
 
   /** Probe at most two servers simultaneously and discard obsolete scan results. */
@@ -479,6 +542,16 @@ function mount() {
 
   function loadList(keepKey) {
     list = serverList();
+    // Peers the lobby heard about ride on top of the remembered list, but the rule lives in rooms.js (withDiscovered)
+    // rather than here: it compares BOTH sides through roomKey(), because the picker keys a remembered server by what
+    // the player typed (`toWsUrl` keeps a pasted path, so `wss://h/play/ws`) while an advert is already root-mounted
+    // (`wss://h/ws`) — comparing them raw would list one server twice. A remembered entry also keeps its own row, so
+    // the player's name and the fact that it is editable survive a stranger's advert.
+    // Nothing here is persisted: rooms.js calls the merged list 「a hint about who is around — never an authority」,
+    // and a hint that outlives the process is just the dead-server problem the remembered list already has.
+    // `foldDiscovered` is assigned before the lobby can report anything (startLobby), so a null here simply means no
+    // lobby has loaded yet — and then `discovered` is empty too, so skipping the fold changes nothing.
+    if (foldDiscovered) list = foldDiscovered(list, discovered, toHttpUrl);
     const savedKey = keyOf(saved);
     selected = (keepKey && list.some((s) => s.key === keepKey)) ? keepKey
       : (savedKey && list.some((s) => s.key === savedKey)) ? savedKey
@@ -612,6 +685,9 @@ function mount() {
       const autoEl = root.querySelector('#sp-auto');
       if (autoEl) autoEl.checked = readItem(K_AUTOSTART, 'localStorage') !== '0';
       renderForm();
+      // The lobby is opened on demand, never at module load: it costs a relay socket, and the 75 kB Trystero bundle
+      // is behind link.js's own dynamic import(). Idempotent, so stepping back and forth to the mode menu is free.
+      void startLobby();
     }
     const hintEl = root.querySelector('#sp-hint');
     if (hintEl) hintEl.textContent = hintText;
@@ -634,6 +710,11 @@ function mount() {
     root,
     destroy() {
       if (boot) boot.style.visibility = bootVisibility || '';
+      // The lobby holds a relay socket, and while it is open this client keeps showing up in everyone else's list.
+      // Best-effort: link.js already treats a failed goodbye as normal.
+      void lobby?.close();
+      lobby = null;
+      lobbyStarted = false;
       root.remove();
       style.remove();
     },

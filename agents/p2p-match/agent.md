@@ -71,6 +71,7 @@ SP_GAME_ROOT=D:/Code/Stronghold-Protocol-upstream npm test → tests 113 / pass 
 
 ```
 test/p2p-rooms.test.js                        14 项全过（纯函数 + vendor 离线闸门）
+                                              ⤷ 接进 picker 后是 20 项（+6 项 withDiscovered），见下
 两个真实 Chrome 页面，无任何服务器配置：
   T1 互相发现            甲 2 行 / 乙 2 行
   T2 对端地址+归一化      wss://b.example/play/ws → wss://b.example/ws
@@ -81,7 +82,20 @@ npm test：不带 checkout 95→109、带 checkout 112→126，两种模式都�
 vendor 的 trystero 0.26.0 过闸门 13 条 OUTBOUND 正则 0 命中（sha256 a7ca3dfd…）
 ```
 
-⚠️ 尚未接进 `shell/picker.js` 的 UI —— 目前是**可用的模块**，不是**玩家能点的按钮**。那是 M1 的收尾。
+**M1 的收尾 —— 接进 `shell/picker.js` 的 UI** — **✅ 代码已写（2026-10-11，在 `feat/p2p-match` 上，未合并）**
+
+在选服页的「多人游戏」页打开 lobby，把听到的 advert 折进服务器列表；玩家不填任何地址也能看到彼此。
+实测（`D:/Code/wt-p2p-ui`，工作树，非引用）：
+
+```
+node --test                                  tests 196 / pass 195 / fail 0 / skipped 1   （基线 190 / 189 / 0 / 1 → +6）
+SP_GAME_ROOT=<game> node --test              tests 217 / pass 217 / fail 0 / skipped 0   （基线 211 / 211 / 0 / 0 → +6）
+tools/check-payload-offline.mjs 的 13 条 OUTBOUND 正则跑改动过的三个文件：link.js / rooms.js / picker.js 全部 0 命中
+node --check 三个文件：通过
+```
+
+⚠️ **仍未验证**：picker UI 的**浏览器端到端**（两个真页面互相发现）没重跑 —— 本机不编译/不运行产物是红线，
+M1 收尾的真实验收要么等 owner 在 runner/真机上跑，要么在 `demo/` 页上复验（demo 走的不是 picker 这条路径）。
 
 **M2 —— 房间发现自动化**
 M1 之上加「自由匹配」：不是选房间，而是按人数/延迟自动配对。
@@ -93,9 +107,9 @@ M1 之上加「自由匹配」：不是选房间，而是按人数/延迟自动�
 
 | 我提供 | 形态 | 谁会用 |
 |---|---|---|
-| `shell/p2p/rooms.js` | 纯函数：房间列表的排序/去重/过滤（与 `picker-core.js` 同风格，无 DOM） | `shell/picker.js` |
-| `shell/p2p/link.js` | Trystero 封装：`openRoom()` / `listRooms()` / `close()` | `shell/p2p/rooms.js` |
-| `globalThis.__SP_P2P__` | 运行期开关，默认 `undefined`（= 功能关闭，行为与今天一致） | 全部 |
+| `shell/p2p/rooms.js` | 纯函数：advert 的归一化/合并/去重（`makeAdvert` / `mergeAdverts` / `roomKey`），以及把听到的结果折进选服列表的 `withDiscovered(base, discovered, httpOf)`。无 DOM、无 socket、无存储 | `shell/p2p/link.js`、`shell/picker.js` |
+| `shell/p2p/link.js` | Trystero 封装：`openLobby()` 返回 `{ publish, state, subscribe, ping, close }`；`DOMESTIC_ICE_SERVERS` 是国内可用的 STUN 默认值 | `shell/picker.js`（唯一订阅者） |
+| `globalThis.__SP_P2P__` | 运行期开关，默认 `undefined`（= 功能关闭，行为与今天一致）；`false` 时 `startLobby()` 直接返回 | 全部 |
 
 **我不改的对外行为**：`shell/picker.js` 现有的 `serverList` / `candidateWsUrls` / `probe` / `showPicker` 导出签名一律不动。
 

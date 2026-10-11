@@ -9,7 +9,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-import { ADVERT_TTL_MS, MAX_ROOMS, makeAdvert, mergeAdverts, roomKey } from '../shell/p2p/rooms.js';
+import { ADVERT_TTL_MS, MAX_ROOMS, makeAdvert, mergeAdverts, roomKey, withDiscovered } from '../shell/p2p/rooms.js';
 // The payload gate's own patterns, imported rather than re-typed — if the gate learns a new reference form, this
 // test must inherit it, otherwise the vendored bundle could start failing CI with this test still green.
 import { OUTBOUND } from '../tools/check-payload-offline.mjs';
@@ -102,6 +102,63 @@ describe('the decentralized lobby list', () => {
     assert.equal(roomKey('wss://h.example/play/ws'), 'wss://h.example/ws');
     assert.equal(roomKey('wss://h.example/ws'), 'wss://h.example/ws');
     assert.equal(roomKey('  '), '');
+  });
+});
+
+describe('folding the lobby into the picker list (withDiscovered)', () => {
+  // picker.js owns the socket→http rule and injects it, so the test injects its own and asserts it was used.
+  const httpOf = (ws) => `http://${String(ws).replace(/^wss?:\/\//, '')}`;
+  // A row as picker.js's serverList() builds it. `key` is `toWsUrl(address)`, which is not importable here (it lives
+  // in the payload's js/net.js), so the fixtures spell out what it returns: for a typed address it keeps the pasted
+  // path. That difference is the whole reason the fold compares through roomKey instead of comparing keys raw.
+  const row = (address, label, key = address) => ({ address, key, label, note: '', http: httpOf(key) });
+
+  test('a peer advertising a server already on the list does not become a second row', () => {
+    const base = [row('wss://h.example/play/ws', '我的服')]; // key keeps the path, as the player typed it
+    const out = withDiscovered(base, [{ address: 'wss://h.example/ws', name: '别人的叫法' }], httpOf);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, 'wss://h.example/play/ws');
+  });
+
+  test("a remembered row keeps the player's own name — a stranger must not rename an editable entry", () => {
+    const base = [row('wss://h.example/play/ws', '我的服')];
+    const [first] = withDiscovered(base, [{ address: 'wss://h.example/ws', name: '别人的叫法' }], httpOf);
+    assert.equal(first.label, '我的服');
+    assert.equal(first.note, '');
+  });
+
+  test('a peer naming a server we do not have is appended, labelled, and carries the injected http URL', () => {
+    const out = withDiscovered([row('wss://mine/ws', '我的服')], [{ address: 'wss://peer/ws', name: '群友的服' }], httpOf);
+    assert.deepEqual(out.map((s) => s.label), ['我的服', '群友的服']);
+    assert.equal(out[1].key, 'wss://peer/ws');
+    assert.equal(out[1].address, 'wss://peer/ws');
+    assert.equal(out[1].note, 'P2P 发现');
+    assert.equal(out[1].http, 'http://peer/ws');
+  });
+
+  test('two peers advertising the same server produce one row', () => {
+    const out = withDiscovered([], [
+      { address: 'wss://h/play/ws', name: 'A' },
+      { address: 'wss://h/ws', name: 'B' },
+    ], httpOf);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].key, 'wss://h/ws');
+  });
+
+  test('a nameless advert still gets a usable label instead of a blank row', () => {
+    const out = withDiscovered([], [{ address: 'wss://h:10166/ws' }], httpOf);
+    assert.equal(out.length, 1);
+    assert.equal(out[0].label, 'wss://h:10166/ws');
+  });
+
+  test('junk off the wire is skipped, never a throw, and the base list is left untouched', () => {
+    const base = [row('wss://mine/ws', '我的服')];
+    const snapshot = JSON.parse(JSON.stringify(base));
+    const out = withDiscovered(base, [null, 42, 'x', {}, { address: '   ' }, undefined], httpOf);
+    assert.equal(out.length, 1);
+    assert.deepEqual(base, snapshot);
+    assert.deepEqual(withDiscovered(base, [], httpOf), base);
+    assert.deepEqual(withDiscovered(base, undefined, httpOf), base);
   });
 });
 
