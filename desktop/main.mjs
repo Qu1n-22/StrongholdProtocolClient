@@ -46,6 +46,13 @@ const WWW_PICK = resolveWww({
 });
 const WWW = WWW_PICK.dir
   || (app.isPackaged ? path.join(process.resourcesPath, 'www') : path.join(HERE, '..', 'build', 'client', 'www'));
+/**
+ * Second root, asked only when `WWW` has no such file. An applied update is a *code* pack (`docs/AUTO-UPDATE.md` §1:
+ * everything except `assets/`), so without this the shell would answer 200 for `index.html` and 404 for every
+ * portrait — the payload would look updated and the game would render nothing. `serverRoots` drops it when it is
+ * the same directory as `WWW`, which is the normal case (no update applied).
+ */
+const WWW_BASE = WWW_PICK.base;
 const TITLE = '卫戍协议：盟约 · STRONGHOLD PROTOCOL';
 
 /**
@@ -68,6 +75,7 @@ function log(...args) {
 // file the player can send us, not reconstructable only from the source. `rejected` is the auto-updater's whole
 // safety story — an applied update that is broken says so here and still plays the bundled game.
 log(`payload 来源：${WWW_PICK.source || '(没有一个候选可用，退回默认)'} → ${WWW}`);
+if (WWW_BASE && WWW_BASE !== WWW) log(`  缺失的文件回落到：${WWW_BASE}`);
 for (const r of WWW_PICK.rejected) log(`  跳过 ${r.source}（${r.dir}）：${r.why}`);
 
 /** `--server host:port` / `--server=host:port` (see the header). */
@@ -207,7 +215,7 @@ async function main() {
   // A pinned port (not `0`) keeps `http://127.0.0.1:<port>` — the page's origin — identical across launches.
   // Chromium scopes localStorage by origin, so this is what lets the identity token, the loadout, settings and
   // the picker's saved server survive a restart; an OS-assigned port would silently discard all of it.
-  const served = await createStaticServer({ root: WWW, port: DEFAULT_PORT, log: console });
+  const served = await createStaticServer({ root: WWW, base: WWW_BASE, port: DEFAULT_PORT, log: console });
   const query = serverOverride
     ? `?server=${encodeURIComponent(serverOverride)}`
     : (chooseServer ? '?pick=1' : '');

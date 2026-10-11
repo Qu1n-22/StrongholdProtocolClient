@@ -760,6 +760,74 @@ describe('desktop shell: a stable loopback origin keeps localStorage', () => {
     }
   });
 
+  test('a code-only overlay serves the installer\'s assets, with the cache rules of the root that answered', async () => {
+    // Why this test exists: an applied update is a *code* pack (docs/AUTO-UPDATE.md §1 — everything except
+    // `assets/`). The server therefore has two roots, and the failure it prevents is the worst kind: after an
+    // update `index.html` answers 200 and every portrait 404s, so the payload looks new and the screen is empty.
+    // Nothing else in the suite starts a server with a second root, so without this the fallback could be dropped
+    // and every existing test would stay green.
+    const { createStaticServer, LONG_CACHE } = await import('../desktop/serve.mjs');
+
+    const overlay = mkdtempSync(path.join(tmpdir(), 'sp-overlay-code-'));
+    const base = mkdtempSync(path.join(tmpdir(), 'sp-overlay-base-'));
+    writeFileSync(path.join(overlay, 'index.html'), '<html>new</html>');
+    writeFileSync(path.join(overlay, 'build.json'), '{"game":{"app":"0.2.3"}}');
+    mkdirSync(path.join(overlay, 'js'), { recursive: true });
+    writeFileSync(path.join(overlay, 'js', 'main.js'), 'new-main');
+    // 空目录：解了一半的更新包正好长这样，服务端必须当"这一份没有"而不是"这个 URL 没有"。
+    mkdirSync(path.join(overlay, 'data'), { recursive: true });
+
+    writeFileSync(path.join(base, 'index.html'), '<html>old</html>');
+    writeFileSync(path.join(base, 'build.json'), '{"game":{"app":"0.2.2"}}');
+    mkdirSync(path.join(base, 'js'), { recursive: true });
+    writeFileSync(path.join(base, 'js', 'main.js'), 'old-main');
+    mkdirSync(path.join(base, 'assets', 'audio', 'bgm'), { recursive: true });
+    writeFileSync(path.join(base, 'assets', 'portrait.png'), 'PNG');
+    writeFileSync(path.join(base, 'assets', 'audio', 'bgm', 'act1.mp3'), 'MP3');
+    mkdirSync(path.join(base, 'data'), { recursive: true });
+    writeFileSync(path.join(base, 'data', 'chess.json'), '{"266":1}');
+
+    // 走 options 而不是 URL 字符串：WHATWG URL 会把 `%2e%2e` 当点段规范化掉，那样"服务端拒了它"这条根本没测到。
+    const get = (urlPath) => new Promise((resolve, reject) => {
+      http.get({ host: '127.0.0.1', port: served.port, path: urlPath }, (r) => {
+        let d = Buffer.alloc(0);
+        r.on('data', (c) => { d = Buffer.concat([d, c]); });
+        r.on('end', () => resolve({ status: r.statusCode, cache: r.headers['cache-control'], body: d.toString() }));
+      }).on('error', reject);
+    });
+
+    let served;
+    try {
+      served = await createStaticServer({ root: overlay, base, port: 0, log: { warn() {}, error() {} } });
+
+      const page = await get('/');
+      assert.equal(page.status, 200, 'a root is a directory, so / must answer with its index.html');
+      assert.equal(page.body, '<html>new</html>', 'the overlay wins for the files it carries');
+
+      assert.equal((await get('/js/main.js')).body, 'new-main');
+      assert.equal((await get('/build.json')).body, '{"game":{"app":"0.2.3"}}');
+
+      const art = await get('/assets/portrait.png');
+      assert.equal(art.status, 200, 'assets/ is never in the code pack — the installer copy has to answer');
+      assert.equal(art.body, 'PNG');
+      assert.equal(art.cache, LONG_CACHE, 'cache rules are relative to the root that answered, not to `root`');
+
+      assert.equal((await get('/media/bgm/act1')).status, 200, 'the audio alias lives under assets/audio too');
+      assert.equal((await get('/data/chess.json')).body, '{"266":1}',
+        'an empty directory in the overlay is a miss in that root, not a 404 for the URL');
+
+      assert.equal((await get('/nope.txt')).status, 404);
+      // 编码过的 `..`：http.get 会把字面量的 `..` 规范化掉，那样根本没测到服务端这条判断。
+      assert.equal((await get('/%2e%2e/etc/passwd')).status, 403, 'a rejected URL stays rejected whichever root would answer');
+      assert.equal((await get('/.hidden')).status, 403);
+      assert.equal((await get('/a%5Cb')).status, 403, 'backslash is how Windows sneaks around a traversal check');
+    } finally {
+      if (served) await served.close();
+      rmSync(overlay, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
   test('the /media alias resolves to the real audio file (the desktop shell has no server/index.js)', async () => {
     const { createStaticServer, MEDIA_PREFIX, AUDIO_EXTS } = await import('../desktop/serve.mjs');
     assert.equal(MEDIA_PREFIX, '/media/');

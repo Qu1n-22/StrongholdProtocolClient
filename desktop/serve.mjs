@@ -131,21 +131,58 @@ export function cacheControlFor(ext, segments) {
 }
 
 /**
- * Resolve a request URL path to a file inside `root`, or null when it must be rejected (traversal, dotfile, …).
- * @param {string} root absolute
+ * Decode and vet a request URL into path segments, or null when it must be rejected (traversal, dotfile, …).
+ *
+ * Split out from {@link resolveTarget} because a request may have to be tried against more than one root: the
+ * payload is cut in two (`docs/AUTO-UPDATE.md` §1), an applied update carries the game code and the installer's copy
+ * carries `assets/`. Whether a URL is *allowed* does not depend on which root answers it, so the check happens once
+ * and the joining happens per root — that way a second root can never be the one that lets a `..` through.
+ *
  * @param {string} rawUrl e.g. `/js/main.js?v=2`
- * @returns {string|null} absolute path (may not exist)
+ * @returns {string[]|null} segments ([] for `/`), or null when rejected
  */
-export function resolveTarget(root, rawUrl) {
+export function urlSegments(rawUrl) {
   const q = rawUrl.indexOf('?');
   let decoded;
   try { decoded = decodeURIComponent(q === -1 ? rawUrl : rawUrl.slice(0, q)); } catch { return null; }
   if (!decoded.startsWith('/') || decoded.includes('\0') || decoded.includes('\\')) return null;
   const segments = decoded.split('/').filter((s) => s.length > 0);
   if (segments.some((s) => s === '..' || s === '.' || s.startsWith('.'))) return null;
+  return segments;
+}
+
+/**
+ * Resolve a request URL path to a file inside `root`, or null when it must be rejected (traversal, dotfile, …).
+ * @param {string} root absolute
+ * @param {string} rawUrl e.g. `/js/main.js?v=2`
+ * @returns {string|null} absolute path (may not exist)
+ */
+export function resolveTarget(root, rawUrl) {
+  const segments = urlSegments(rawUrl);
+  if (!segments) return null;
   const target = path.join(root, ...segments);
   if (target !== root && !target.startsWith(root + path.sep)) return null;
   return target;
+}
+
+/**
+ * The roots a request is tried against, best-first: the payload we chose to serve, then the copy inside the
+ * installer. `base` is only consulted when the chosen payload does not have the file — which is the normal case for
+ * everything under `assets/`, because the code pack deliberately excludes it.
+ *
+ * @param {string} root absolute
+ * @param {string|undefined|null} base absolute, optional
+ * @returns {string[]} 1 or 2 roots
+ */
+export function serverRoots(root, base) {
+  const roots = [path.resolve(root)];
+  if (base) {
+    const b = path.resolve(base);
+    // A base that *is* the root would just be the same lookup twice; two different roots must not nest, or the
+    // relative path used for cache rules and the media alias could resolve differently in each.
+    if (b !== roots[0]) roots.push(b);
+  }
+  return roots;
 }
 
 /** `bytes=a-b` → [start, end] clamped to the file, or null (ignored / unsatisfiable). */
@@ -167,16 +204,59 @@ export function parseRange(header, size) {
  * and letting the OS pick one (`port: 0`). The caller keeps the resulting origin stable by passing a fixed port
  * (see DEFAULT_PORT) — persistence in the page depends on it.
  *
- * @param {{ root: string, host?: string, port?: number, log?: { warn?: Function, error?: Function } }} opts
+ * `base` is the second root, consulted only when `root` has no such file. An applied update is a *code* pack
+ * (`docs/AUTO-UPDATE.md` §1: everything except `assets/`), so without the fallback every spine, portrait and BGM
+ * would 404 the moment a player updates — the payload would look updated and render nothing.
+ *
+ * @param {{ root: string, base?: string, host?: string, port?: number, log?: { warn?: Function, error?: Function } }} opts
  * @returns {Promise<{ url: string, port: number, server: http.Server, close: () => Promise<void> }>}
  */
-export function createStaticServer({ root, host = '127.0.0.1', port = 0, log = console } = {}) {
-  const rootAbs = path.resolve(root);
+export function createStaticServer({ root, base, host = '127.0.0.1', port = 0, log = console } = {}) {
+  const roots = serverRoots(root, base);
 
   const finish = (req, res, status, headers, body) => {
     res.writeHead(status, headers);
     res.end(req.method === 'HEAD' ? undefined : body);
   };
+
+  const notFound = (req, res, forbidden) => finish(
+    req, res, forbidden ? 403 : 404,
+    { 'Content-Type': 'text/plain; charset=utf-8' },
+    forbidden ? 'forbidden' : 'not found',
+  );
+
+  /**
+   * First root that really has this URL as a file, best-first. A directory answers with its `index.html` (a root
+   * *is* a directory, so `/` has to). A root that has the directory but no `index.html` is a miss, not an answer —
+   * otherwise a partially extracted overlay would shadow the installer's copy with a 404.
+   *
+   * `forbidden` is only reported when *no* root had the file: an unreadable file in the overlay must not be
+   * reported as "not found", and it must not silently serve the older copy either.
+   *
+   * @returns {Promise<{ absPath: string, stat: import('node:fs').Stats, root: string } | { forbidden: true } | null>}
+   */
+  async function pick(rawUrl) {
+    const isAlias = (rawUrl.split('?')[0] || '').startsWith(MEDIA_PREFIX);
+    let denied = false;
+    for (const r of roots) {
+      // `/media/…` never names a real directory: it is the alias, or it is nothing. Falling through to a
+      // `<root>/media/…` lookup would answer a request for music with whatever happens to sit there.
+      const absPath = isAlias ? await resolveMediaPath(r, rawUrl) : resolveTarget(r, rawUrl);
+      if (!absPath) continue;
+      try {
+        let stat = await fsp.stat(absPath);
+        let file = absPath;
+        if (stat.isDirectory()) {
+          file = path.join(absPath, 'index.html');
+          stat = await fsp.stat(file);
+        }
+        if (stat.isFile()) return { absPath: file, stat, root: r };
+      } catch (e) {
+        if (e && (e.code === 'EACCES' || e.code === 'EPERM')) denied = true;
+      }
+    }
+    return denied ? { forbidden: true } : null;
+  }
 
   async function handle(req, res) {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -184,34 +264,17 @@ export function createStaticServer({ root, host = '127.0.0.1', port = 0, log = c
       finish(req, res, 405, { 'Content-Type': 'text/plain; charset=utf-8' }, 'method not allowed');
       return;
     }
-    const target = resolveTarget(rootAbs, req.url || '/');
-    if (!target) { finish(req, res, 403, { 'Content-Type': 'text/plain; charset=utf-8' }, 'forbidden'); return; }
+    const rawUrl = req.url || '/';
+    if (!urlSegments(rawUrl)) { notFound(req, res, true); return; }
 
-    // `/media/…` never names a real directory — resolve it to the audio file it aliases, and 404 on a miss
-    // instead of falling through to a `<root>/media/…` lookup.
-    let absPath = await resolveMediaPath(rootAbs, req.url || '/');
-    if (!absPath) {
-      if ((req.url || '').split('?')[0].startsWith(MEDIA_PREFIX)) {
-        finish(req, res, 404, { 'Content-Type': 'text/plain; charset=utf-8' }, 'not found');
-        return;
-      }
-      absPath = target;
-    }
-    let stat;
-    try {
-      stat = await fsp.stat(absPath);
-      if (stat.isDirectory()) {
-        absPath = path.join(absPath, 'index.html');
-        stat = await fsp.stat(absPath);
-      }
-      if (!stat.isFile()) throw Object.assign(new Error('not a file'), { code: 'ENOENT' });
-    } catch (e) {
-      const status = e && (e.code === 'EACCES' || e.code === 'EPERM') ? 403 : 404;
-      finish(req, res, status, { 'Content-Type': 'text/plain; charset=utf-8' }, status === 403 ? 'forbidden' : 'not found');
-      return;
-    }
+    const hit = await pick(rawUrl);
+    if (!hit) { notFound(req, res, false); return; }
+    if (hit.forbidden) { notFound(req, res, true); return; }
+    const { absPath, stat } = hit;
 
-    const segments = path.relative(rootAbs, absPath).split(path.sep);
+    // Cache rules are relative to the root that answered, so a file served out of the installer's copy is still
+    // recognised as living under `assets/` and gets the long cache.
+    const segments = path.relative(hit.root, absPath).split(path.sep);
     const ext = path.extname(absPath).toLowerCase();
     const etag = `"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
     const headers = {

@@ -195,8 +195,8 @@ fn message_box(msg: &str, icon: u32) {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let www = locate_www()?;
-    if !www.join("index.html").is_file() {
-        return Err(format!("这个包是坏的：{} 不存在", www.join("index.html").display()).into());
+    if !www.dir.join("index.html").is_file() {
+        return Err(format!("这个包是坏的：{} 不存在", www.dir.join("index.html").display()).into());
     }
 
     // 单实例先看内核对象，再看端口：顺序很重要 —— 互斥量连"正在启动、还没开始服务"的那个实例也算得到，
@@ -214,7 +214,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let stats = Arc::new(ServeStats::default());
     let shell = ShellSlot::new();
-    let (port, _thread) = server::spawn_server_with(www.clone(), Arc::clone(&stats), Some(Arc::new(shell.clone())))?;
+    let (port, _thread) = server::spawn_server_with(
+        server::server_roots(&www.dir, www.base.as_deref()),
+        Arc::clone(&stats),
+        Some(Arc::new(shell.clone())),
+    )?;
     // 端口挪走了就等于换了 origin，而 localStorage 是按 origin 存的：这件事必须说出来，不能让玩家自己发现"存档没了"。
     if port != server::DEFAULT_PORT {
         eprintln!("[tauri] 端口 {} 被占，改用 {port}", server::DEFAULT_PORT);
@@ -230,7 +234,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let url = format!("http://127.0.0.1:{port}/");
     let probe = std::env::var("SP_TAU_BOOT_PROBE").is_ok();
-    println!("[tauri] 静态服务 port={port} root={}", www.display());
+    println!("[tauri] 静态服务 port={port} root={}", www.dir.display());
 
     let probe_for_setup = probe;
     let stats_for_setup = Arc::clone(&stats);
@@ -297,6 +301,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 这一跑要服务的 payload 根，外加"它没有的文件去哪找"。
+struct Payload {
+    /// 服务用的那一份。
+    dir: PathBuf,
+    /// 回落根：安装目录内置那份。`None` = 只有一个根。
+    ///
+    /// 已应用的更新是**代码包**（`docs/AUTO-UPDATE.md` §1：除 `assets/` 外的全部），所以少了这一层，玩家一更新
+    /// 就会「`index.html` 200、每张立绘 404」—— 包看着是新的、画面是空的，而这种报告从一张截图里根本看不出来。
+    /// 与 `desktop/payload-path.mjs` 的 `resolveWww().base` 是同一个约定的两份实现。
+    base: Option<PathBuf>,
+}
+
 /// payload 在哪，最好的一批排前面：`$SP_WWW`（测试与"素材放在安装目录外"的机器）→ **已应用的更新**
 /// `<userData>/payload/current` → 安装目录里的 `www` → exe 旁边 → 开发用的 checkout。
 ///
@@ -305,32 +321,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// 这种在同一个人电脑上并存的事。判"合格"要两个文件（`index.html` + `build.json`）而不是"目录存在"：
 /// 解了一半的更新包正好有前者没后者，那种目录服务起来是白屏。不合格的一律跳过、继续往下找 —— 更新坏了
 /// 不能让玩家连内置那份都玩不了。
-fn locate_www() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn locate_www() -> Result<Payload, Box<dyn std::error::Error>> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
+    // 安装目录里那份：它同时是"选中了哪份"的候选，也是"缺文件时回落给谁"的答案。
+    let installed = [exe_dir.join("www"), exe_dir.join("resources").join("www")];
     let cands: [(&str, Option<PathBuf>); 6] = [
         ("SP_WWW", std::env::var("SP_WWW").ok().map(PathBuf::from)),
         ("已应用的更新", app_data_dir().map(|d| d.join("payload").join("current"))),
-        ("安装目录", Some(exe_dir.join("www"))),
-        ("安装目录(resources/www)", Some(exe_dir.join("resources").join("www"))),
+        ("安装目录", Some(installed[0].clone())),
+        ("安装目录(resources/www)", Some(installed[1].clone())),
         ("开发 checkout", Some(PathBuf::from("src-tauri/www"))),
         ("当前目录", Some(PathBuf::from("www"))),
     ];
     let (picked, skipped) = first_usable_payload(&cands);
     let why = skipped.join(" | ");
-    if let Some(dir) = picked {
-        if !skipped.is_empty() {
-            eprintln!("[tauri] 跳过的候选：{why}");
-        }
-        return Ok(dir);
+    if !skipped.is_empty() {
+        eprintln!("[tauri] 跳过的候选：{why}");
     }
-    Err(format!(
-        "找不到 payload 目录 www/ —— 构建时必须把 payload 解到 src-tauri/www 并当资源打进包里。{}",
-        if why.is_empty() { String::new() } else { format!("（试过的都不合格：{why}）") }
-    )
-    .into())
+    let dir = picked.ok_or_else(|| {
+        format!(
+            "找不到 payload 目录 www/ —— 构建时必须把 payload 解到 src-tauri/www 并当资源打进包里。{}",
+            if why.is_empty() { String::new() } else { format!("（试过的都不合格：{why}）") }
+        )
+    })?;
+    // 回落根只认安装目录里那份，而且是"合格且不是选中那一份"的第一个：不合格的目录接不住任何请求，
+    // 选中的那一份作为自己的回落毫无意义（`server_roots` 也会把它丢掉）。
+    let base = installed
+        .iter()
+        .find(|d| d.as_path() != dir.as_path() && payload_problem(d.as_path()).is_none())
+        .cloned();
+    if let Some(b) = &base {
+        eprintln!("[tauri] 缺失的文件回落到：{}", b.display());
+    }
+    Ok(Payload { dir, base })
 }
 
 /// 第一个合格的目录，外加"哪些候选因为什么被跳过"。跳过的一定要能说出来：玩家报"更新没生效"时，

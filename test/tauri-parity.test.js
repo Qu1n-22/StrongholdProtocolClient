@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MIME, AUDIO_EXTS, LONG_CACHE_DIRS, DEFAULT_PORT, PORT_SEARCH, cacheControlFor, createStaticServer } from '../desktop/serve.mjs';
+import { MIME, AUDIO_EXTS, LONG_CACHE_DIRS, DEFAULT_PORT, PORT_SEARCH, cacheControlFor, createStaticServer, serverRoots, urlSegments } from '../desktop/serve.mjs';
 import { CURRENT_LINK, OVERLAY_DIR, wwwCandidates } from '../desktop/payload-path.mjs';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -303,4 +303,39 @@ test('both shells resolve the payload directory by the same rules', () => {
   const idm = /const APP_DATA_NAME: &str = "([^"]+)";/.exec(main);
   assert.ok(idm, 'Rust 里要有 APP_DATA_NAME 这个常量');
   assert.equal(idm[1], conf.identifier, 'APP_DATA_NAME 与 tauri.conf.json 的 identifier 不一致');
+});
+
+// 两个壳都得能"第二个根"接住更新包里没有的文件。
+//
+// 已应用的更新是**代码包**（docs/AUTO-UPDATE.md §1：除 assets/ 外的全部）。只有一个根时，玩家一更新就是
+// 「index.html 200、每张立绘 404」—— 包看着是新的、画面是空的。这条不是"多查一次"的优化，是那个功能的
+// 正确性本身，所以两边的实现要一起被钉住：只在一侧加回落，另一侧就会安静地烂掉。
+test('both shells ask a second root for the files an applied update does not carry', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'tauri', 'src-tauri', 'src', 'main.rs'), 'utf8');
+  const jsMain = fs.readFileSync(path.join(ROOT, 'desktop', 'main.mjs'), 'utf8');
+
+  // 1) 两边各有一个"多根"的入口，名字与职责对应。
+  assert.match(RUST, /pub fn server_roots\(/, 'Rust 侧要有 server_roots（JS 侧是 serverRoots）');
+  assert.match(RUST, /pub fn pick_file\(/, 'Rust 侧要逐根解析（JS 侧是 createStaticServer 里的 pick）');
+  assert.match(RUST, /pub fn url_segments\(/, 'URL 合不合法要和"哪个根来答"分开判，否则第二个根会变成放行 .. 的那个');
+  assert.equal(typeof serverRoots, 'function');
+  assert.equal(typeof urlSegments, 'function');
+
+  // 2) "回落根等于自己"要在两边都被丢掉 —— 否则每次请求都白查一遍。
+  assert.match(RUST, /if b != root \{/, 'Rust 的 server_roots 要丢掉与自己相同的 base');
+  const sameDir = serverRoots('X', 'X');
+  assert.deepEqual(sameDir, [path.resolve('X')], 'JS 的 serverRoots 也要丢掉与自己相同的 base');
+
+  // 3) 回落根从哪来：JS 是 resolveWww().base，Rust 是 locate_www() 返回的 Payload.base —— 两边都得真的把它
+  //    交给服务器，只"算出来"不交等于没做。
+  assert.match(main, /base: Option<PathBuf>/, 'Tauri 的 locate_www 必须把回落根返回出去');
+  assert.match(main, /server_roots\(&www\.dir, www\.base\.as_deref\(\)\)/, 'Tauri 必须把回落根交给静态服务');
+  assert.match(jsMain, /createStaticServer\(\{ root: WWW, base: WWW_BASE/, 'Electron 必须把回落根交给静态服务');
+
+  // 4) 回落根只认安装目录那份 —— 不是"候选列表里的下一个"。拿候选列表当来源，开发机上的构建产物（或一个
+  //    测试用的 $SP_WWW）就会变成玩家美术的来源，而那种错在本地永远看不出来。
+  assert.match(main, /let installed = \[exe_dir\.join\("www"\)/, 'Rust 要有一个明确的"安装目录那份"数组');
+  assert.match(main, /let base = installed\s*\n\s*\.iter\(\)/, '回落根必须从 installed 里选，而不是从候选清单里选');
+  assert.ok(!/base[\s\S]{0,200}开发 checkout/.test(main.slice(main.indexOf('let base = installed'))),
+    '回落根不能来自开发 checkout');
 });

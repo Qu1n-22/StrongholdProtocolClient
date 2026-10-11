@@ -131,9 +131,13 @@ fn push_segments(root: &Path, segments: &[&str]) -> PathBuf {
     p
 }
 
-/// `/js/main.js?v=2` → `<root>/js/main.js`, or None for anything that tries to leave the root (traversal, a dot
-/// segment, a backslash, a NUL, an absolute-ness failure). Mirrors `resolveTarget`.
-pub fn resolve_target(root: &Path, raw_url: &str) -> Option<PathBuf> {
+/// Decode and vet a request URL into path segments, or None when it must be rejected (traversal, dotfile, a
+/// backslash, a NUL, an absolute-ness failure). Mirrors `urlSegments` in `desktop/serve.mjs`.
+///
+/// Split out from `resolve_target` because a request may have to be tried against more than one root (see
+/// `server_roots`). Whether a URL is *allowed* does not depend on which root answers it, so the check happens once
+/// and the joining happens per root — that way a second root can never be the one that lets a `..` through.
+pub fn url_segments(raw_url: &str) -> Option<Vec<String>> {
     let (path_part, _) = split_query(raw_url);
     let decoded = percent_decode(path_part)?;
     if !decoded.starts_with('/') || decoded.contains('\0') || decoded.contains('\\') {
@@ -143,10 +147,18 @@ pub fn resolve_target(root: &Path, raw_url: &str) -> Option<PathBuf> {
     if segments.iter().any(|s| *s == ".." || *s == "." || s.starts_with('.')) {
         return None;
     }
+    Some(segments.into_iter().map(|s| s.to_string()).collect())
+}
+
+/// `/js/main.js?v=2` → `<root>/js/main.js`, or None for anything that tries to leave the root. Mirrors
+/// `resolveTarget`.
+pub fn resolve_target(root: &Path, raw_url: &str) -> Option<PathBuf> {
+    let segments = url_segments(raw_url)?;
     if segments.is_empty() {
         return Some(root.to_path_buf());
     }
-    let target = push_segments(root, &segments);
+    let refs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+    let target = push_segments(root, &refs);
     let root_s = root.to_string_lossy();
     let target_s = target.to_string_lossy();
     if target_s != root_s.as_ref() && !target_s.starts_with(&format!("{root_s}{}", std::path::MAIN_SEPARATOR)) {
@@ -208,6 +220,87 @@ pub fn resolve_media_path(root: &Path, raw_url: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// The roots a request is tried against, best-first: the payload we chose to serve, then the copy inside the
+/// installer. Mirrors `serverRoots` in `desktop/serve.mjs`.
+///
+/// The payload is cut in two (`docs/AUTO-UPDATE.md` §1): an applied update carries the game code and the installer's
+/// copy carries `assets/`. Without the second root every spine, portrait and BGM would 404 the moment a player
+/// updates — the payload would look updated and render nothing. A `base` equal to `root` is dropped: it would be the
+/// same lookup twice.
+pub fn server_roots(root: &Path, base: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![root.to_path_buf()];
+    if let Some(b) = base {
+        if b != root {
+            roots.push(b.to_path_buf());
+        }
+    }
+    roots
+}
+
+/// What a request resolved to. `root` is the one that answered, because the cache rules are computed relative to it
+/// (a file served out of the installer's copy must still be recognised as living under `assets/`).
+pub enum Pick {
+    Hit {
+        abs: PathBuf,
+        md: std::fs::Metadata,
+        root: PathBuf,
+    },
+    Forbidden,
+    Miss,
+}
+
+/// First root that really has this URL as a file, best-first. Mirrors `pick` in `desktop/serve.mjs`.
+///
+/// A directory answers with its `index.html` (a root *is* a directory, so `/` has to). A root that has the directory
+/// but no `index.html` is a miss, not an answer — otherwise a half-extracted overlay would shadow the installer's
+/// copy with a 404, which is exactly the "updated and now it is blank" report we cannot debug from a screenshot.
+///
+/// `Forbidden` is only reported when *no* root had the file: an unreadable file in the overlay must not be reported
+/// as "not found", and it must not silently serve the older copy either.
+pub fn pick_file(roots: &[PathBuf], raw_url: &str) -> Pick {
+    // `/media/…` never names a real directory: it is the alias, or it is nothing. Falling through to a
+    // `<root>/media/…` lookup would answer a request for music with whatever happens to sit there.
+    let is_alias = split_query(raw_url).0.starts_with(MEDIA_PREFIX);
+    let mut denied = false;
+    for r in roots {
+        let candidate = if is_alias {
+            resolve_media_path(r, raw_url)
+        } else {
+            resolve_target(r, raw_url)
+        };
+        let Some(candidate) = candidate else { continue };
+        let (abs, md) = match std::fs::metadata(&candidate) {
+            Ok(m) if m.is_dir() => {
+                let index = candidate.join("index.html");
+                match std::fs::metadata(&index) {
+                    Ok(m2) => (index, m2),
+                    Err(_) => continue,
+                }
+            }
+            Ok(m) => (candidate, m),
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied = true;
+                }
+                continue;
+            }
+        };
+        if !md.is_file() {
+            continue;
+        }
+        return Pick::Hit {
+            abs,
+            md,
+            root: r.clone(),
+        };
+    }
+    if denied {
+        Pick::Forbidden
+    } else {
+        Pick::Miss
+    }
 }
 
 /// Mirrors `cacheControlFor`: html always revalidates, the content-addressed top-level dirs get a day.
@@ -351,7 +444,7 @@ impl Req {
 /// about six of each for the same page.
 fn serve_connection(
     mut sock: TcpStream,
-    root: &Path,
+    roots: &[PathBuf],
     stats: &Arc<ServeStats>,
     shell: &Option<Arc<dyn ShellCommand>>,
     t0: std::time::Instant,
@@ -399,7 +492,7 @@ fn serve_connection(
             version: parts.next().unwrap_or("HTTP/1.0").to_string(),
             headers,
         };
-        match handle_request(&mut sock, root, stats, shell, t0, &req) {
+        match handle_request(&mut sock, roots, stats, shell, t0, &req) {
             Ok(true) => continue,
             Ok(false) | Err(_) => return,
         }
@@ -409,7 +502,7 @@ fn serve_connection(
 /// Answer one request on a connection. `Ok(true)` = this socket may be reused for the next request.
 fn handle_request(
     sock: &mut TcpStream,
-    root: &Path,
+    roots: &[PathBuf],
     stats: &Arc<ServeStats>,
     shell: &Option<Arc<dyn ShellCommand>>,
     t0: std::time::Instant,
@@ -468,47 +561,23 @@ fn handle_request(
         return Ok(false);
     }
 
-    let target = match resolve_target(root, raw_url) {
-        Some(p) => p,
-        None => {
+    // A URL we refuse outright is 403; a URL no root has is 404. Keeping those apart matters when the second root
+    // is an applied update: "the overlay has it, the installer does not" is a normal 200, not an error.
+    if url_segments(raw_url).is_none() {
+        let _ = write_plain(sock, "403 Forbidden", "forbidden", "");
+        return Ok(false);
+    }
+    let (abs, md, served_from) = match pick_file(roots, raw_url) {
+        Pick::Hit { abs, md, root } => (abs, md, root),
+        Pick::Forbidden => {
             let _ = write_plain(sock, "403 Forbidden", "forbidden", "");
             return Ok(false);
         }
-    };
-
-    let is_media_alias = split_query(raw_url).0.starts_with(MEDIA_PREFIX);
-    let mut abs = match resolve_media_path(root, raw_url) {
-        Some(p) => p,
-        None => {
-            if is_media_alias {
-                let _ = write_plain(sock, "404 Not Found", "not found", "");
-                return Ok(false);
-            }
-            target
-        }
-    };
-
-    let md = match std::fs::metadata(&abs) {
-        Ok(m) if m.is_dir() => {
-            abs = abs.join("index.html");
-            match std::fs::metadata(&abs) {
-                Ok(m2) => m2,
-                Err(_) => {
-                    let _ = write_plain(sock, "404 Not Found", "not found", "");
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(m) => m,
-        Err(_) => {
+        Pick::Miss => {
             let _ = write_plain(sock, "404 Not Found", "not found", "");
             return Ok(false);
         }
     };
-    if !md.is_file() {
-        let _ = write_plain(sock, "404 Not Found", "not found", "");
-        return Ok(false);
-    }
     let size = md.len();
     let mtime_ms = md
         .modified()
@@ -516,7 +585,9 @@ fn handle_request(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let rel = abs.strip_prefix(root).unwrap_or(Path::new("")).to_string_lossy().to_string();
+    // Cache rules are relative to the root that answered, so a file served out of the installer's copy is still
+    // recognised as living under `assets/` and gets the long cache.
+    let rel = abs.strip_prefix(&served_from).unwrap_or(Path::new("")).to_string_lossy().to_string();
     let segments: Vec<&str> = rel.split(std::path::MAIN_SEPARATOR).filter(|s| !s.is_empty()).collect();
     let ext = Path::new(&abs)
         .extension()
@@ -612,12 +683,15 @@ fn write_plain(sock: &mut TcpStream, status: &str, body: &str, extra: &str) -> s
 /// Bind and serve on a background thread. Returns the bound port (the caller builds the window URL from it, and the
 /// whole point of pinning is that the page's origin — and therefore its localStorage — stays put across launches).
 pub fn spawn_server(root: PathBuf, stats: Arc<ServeStats>) -> std::io::Result<(u16, thread::JoinHandle<()>)> {
-    spawn_server_with(root, stats, None)
+    spawn_server_with(server_roots(&root, None), stats, None)
 }
 
 /// `spawn_server` plus the shell command handler (the Tauri `main` passes one; tests pass a recording fake).
+///
+/// `roots` is best-first (see `server_roots`): the payload we chose to serve, then the installer's copy as the
+/// fallback for everything the chosen one does not have.
 pub fn spawn_server_with(
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     stats: Arc<ServeStats>,
     shell: Option<Arc<dyn ShellCommand>>,
 ) -> std::io::Result<(u16, thread::JoinHandle<()>)> {
@@ -642,10 +716,10 @@ pub fn spawn_server_with(
     let t0 = std::time::Instant::now();
     let h = thread::spawn(move || {
         for sock in l.incoming().flatten() {
-            let root = root.clone();
+            let roots = roots.clone();
             let stats = Arc::clone(&stats);
             let shell = shell.clone();
-            thread::spawn(move || serve_connection(sock, &root, &stats, &shell, t0));
+            thread::spawn(move || serve_connection(sock, &roots, &stats, &shell, t0));
         }
     });
     Ok((port, h))
@@ -897,7 +971,7 @@ mod tests {
         let stats = Arc::new(ServeStats::default());
         let shell = Arc::new(FakeShell { calls: std::sync::Mutex::new(Vec::new()) });
         let handler: Arc<dyn ShellCommand> = shell.clone();
-        let (port, _h) = spawn_server_with(root.clone(), Arc::clone(&stats), Some(handler)).unwrap();
+        let (port, _h) = spawn_server_with(server_roots(&root, None), Arc::clone(&stats), Some(handler)).unwrap();
 
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -936,5 +1010,135 @@ mod tests {
         assert!(got.contains("503 Service Unavailable"), "没有壳处理器时该答 503：{got:?}");
         assert!(got.contains("fullscreen=unavailable"), "正文要说清为什么：{got:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- 两个根：一份"已应用的更新"（只有代码）+ 安装目录内置那份（有 assets/） --------------------------
+
+    /// 两个沙箱：`root` 当"已应用的更新"（只有代码），`base` 当安装目录内置那份（有 assets/）。
+    fn two_roots(tag: &str) -> (PathBuf, PathBuf) {
+        (sandbox(&format!("{tag}-code")), sandbox(&format!("{tag}-base")))
+    }
+
+    #[test]
+    fn server_roots_keeps_a_base_equal_to_the_root_out_of_the_lookup() {
+        let r = PathBuf::from("/base/www");
+        assert_eq!(server_roots(&r, None), vec![r.clone()]);
+        assert_eq!(server_roots(&r, Some(&r)), vec![r.clone()], "同一个目录不该查两遍");
+        assert_eq!(
+            server_roots(&r, Some(Path::new("/other/www"))),
+            vec![r.clone(), PathBuf::from("/other/www")],
+            "顺序就是优先级"
+        );
+    }
+
+    #[test]
+    fn art_is_served_out_of_the_installer_when_the_overlay_is_a_code_pack() {
+        // 代码包不含 assets/（docs/AUTO-UPDATE.md §1）。没有第二个根，玩家一更新就全体立绘 404 ——
+        // 包看着是新的、画面是空的，而这种报告从一张截图里根本看不出来。
+        let (code, base) = two_roots("overlay-art");
+        fs::write(code.join("index.html"), "new").unwrap();
+        fs::create_dir_all(base.join("assets")).unwrap();
+        fs::write(base.join("assets/portrait.png"), "art").unwrap();
+
+        let roots = server_roots(&code, Some(&base));
+        match pick_file(&roots, "/assets/portrait.png") {
+            Pick::Hit { abs, root, .. } => {
+                assert_eq!(abs, base.join("assets/portrait.png"));
+                assert_eq!(root, base, "缓存规则按回答的那个根算，所以要说得出是它");
+            }
+            _ => panic!("assets/ 必须从内置那份出来"),
+        }
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_overlay_wins_for_the_files_it_does_carry() {
+        let (code, base) = two_roots("overlay-wins");
+        fs::write(code.join("index.html"), "new").unwrap();
+        fs::write(base.join("index.html"), "old").unwrap();
+        let roots = server_roots(&code, Some(&base));
+        match pick_file(&roots, "/index.html") {
+            Pick::Hit { abs, root, .. } => {
+                assert_eq!(abs, code.join("index.html"));
+                assert_eq!(root, code);
+            }
+            _ => panic!("overlay 里有的文件必须用它自己的"),
+        }
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_only_the_installer_has_is_a_miss_in_the_overlay_not_a_404() {
+        // 目录在、index.html 不在，正是"解包解了一半"的形状。这时候必须继续往第二个根找：
+        // 一个根里没有 ≠ 这个 URL 没有，否则一次失败的更新就把能玩的客户端变成白屏。
+        let (code, base) = two_roots("overlay-half");
+        fs::create_dir_all(code.join("js")).unwrap();
+        fs::write(code.join("js/main.js"), "new").unwrap();
+        fs::create_dir_all(base.join("data")).unwrap();
+        fs::write(base.join("data/chess.json"), "{}").unwrap();
+
+        let roots = server_roots(&code, Some(&base));
+        match pick_file(&roots, "/data/chess.json") {
+            Pick::Hit { abs, .. } => assert_eq!(abs, base.join("data/chess.json")),
+            _ => panic!("第二个根必须接住"),
+        }
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_media_alias_is_tried_in_both_roots() {
+        // 音频住在 assets/audio（代码包不含），所以别名解析也必须走第二个根 —— 否则"更新后全体静音"。
+        let (code, base) = two_roots("overlay-media");
+        fs::write(code.join("index.html"), "new").unwrap();
+        fs::create_dir_all(base.join("assets/audio/bgm")).unwrap();
+        fs::write(base.join("assets/audio/bgm/act1.mp3"), "mp3").unwrap();
+        let roots = server_roots(&code, Some(&base));
+        match pick_file(&roots, "/media/bgm/act1?v=3") {
+            Pick::Hit { abs, .. } => assert_eq!(abs, base.join("assets/audio/bgm/act1.mp3")),
+            _ => panic!("别名必须能从内置那份解析"),
+        }
+        assert!(matches!(pick_file(&roots, "/media/bgm/nope"), Pick::Miss), "两个根都没有就是 404");
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_url_that_leaves_the_root_is_refused_before_any_root_is_asked() {
+        // URL 合不合法与"哪个根来答"无关，所以在进 pick 之前就判掉 —— 第二个根不该是那个放行 `..` 的。
+        assert!(url_segments("/../etc/passwd").is_none());
+        assert!(url_segments("/a%00b").is_none());
+        assert!(url_segments("/js/main.js?v=2").is_some());
+        let (code, base) = two_roots("overlay-traversal");
+        let roots = server_roots(&code, Some(&base));
+        assert!(matches!(pick_file(&roots, "/../etc/passwd"), Pick::Miss), "不合法就查不到");
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_code_only_overlay_serves_the_installer_assets_over_http() {
+        // 端到端的那一条：真的起服务、真的发一次 GET，看状态码、类型与缓存头。
+        let (code, base) = two_roots("overlay-http");
+        fs::write(code.join("index.html"), "<html>new</html>").unwrap();
+        fs::create_dir_all(base.join("assets")).unwrap();
+        fs::write(base.join("assets/portrait.png"), "PNG").unwrap();
+
+        let stats = Arc::new(ServeStats::default());
+        let (port, _h) = spawn_server_with(server_roots(&code, Some(&base)), Arc::clone(&stats), None).unwrap();
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        ask(&mut s, "GET /assets/portrait.png HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let got = read_until(&mut s, "PNG");
+        assert!(got.contains("200 OK"), "回落来的素材必须是 200：{got:?}");
+        assert!(got.contains("Content-Type: image/png"), "{got:?}");
+        assert!(
+            got.contains("Cache-Control: public, max-age=86400"),
+            "assets/ 的长缓存要按回答的那个根认出来：{got:?}"
+        );
+        let _ = fs::remove_dir_all(&code);
+        let _ = fs::remove_dir_all(&base);
     }
 }

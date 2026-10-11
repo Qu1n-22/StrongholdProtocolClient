@@ -31,9 +31,13 @@ export function payloadProblem(dir, { isFile, join = path.join }) {
  * members — `SP_WWW` beating an applied update is what makes the overlay debuggable, and the bundled copy coming
  * before the dev checkout is what keeps a stray `www/` in a working directory from shadowing the installed game.
  *
+ * `base: true` marks the one candidate that is also the **fallback root**: an applied update is a *code* pack
+ * (`docs/AUTO-UPDATE.md` §1 — everything except `assets/`), so the server has to answer for the art out of the copy
+ * the installer left behind. Without it, a player who updates gets a payload that looks new and renders nothing.
+ *
  * @param {{ env?: Record<string,string|undefined>, resourcesPath?: string, userData?: string,
  *           devDir?: string }} o
- * @returns {{ dir: string, source: string }[]}
+ * @returns {{ dir: string, source: string, base?: true }[]}
  */
 export function wwwCandidates({ env = {}, resourcesPath, userData, devDir }) {
   const out = [];
@@ -43,7 +47,7 @@ export function wwwCandidates({ env = {}, resourcesPath, userData, devDir }) {
     // `app.getPath('userData')` hands us the right one, so this module never derives it itself.
     out.push({ dir: path.join(userData, OVERLAY_DIR, CURRENT_LINK), source: '已应用的更新' });
   }
-  if (resourcesPath) out.push({ dir: path.join(resourcesPath, 'www'), source: '安装包内置' });
+  if (resourcesPath) out.push({ dir: path.join(resourcesPath, 'www'), source: '安装包内置', base: true });
   if (devDir) out.push({ dir: path.join(devDir, 'build', 'client', 'www'), source: '仓库里的构建产物' });
   return out;
 }
@@ -52,15 +56,24 @@ export function wwwCandidates({ env = {}, resourcesPath, userData, devDir }) {
  * Pick the payload to serve. `isFile` is injected rather than read here: the shells ask a real filesystem while the
  * tests ask a Map, and "is this a usable payload" is the one judgement both must make identically.
  *
- * @param {{ candidates: {dir:string, source:string}[], isFile: (p:string)=>boolean }} o
- * @returns {{ dir: string|null, source: string, rejected: {dir:string, source:string, why:string}[] }}
+ * `base` is the fallback root (see {@link wwwCandidates}) — the second root the server asks when the chosen payload
+ * does not have a file. It is looked up from the candidate list rather than assumed, because a dev checkout or
+ * `SP_WWW` can be the chosen payload while the installer's copy is still what has the art. It is `undefined` when
+ * there is no such candidate, and the server then has exactly one root.
+ *
+ * @param {{ candidates: {dir:string, source:string, base?:true}[], isFile: (p:string)=>boolean }} o
+ * @returns {{ dir: string|null, source: string, base: string|undefined,
+ *             rejected: {dir:string, source:string, why:string}[] }}
  */
 export function resolveWww({ candidates, isFile }) {
   const rejected = [];
   for (const c of candidates) {
     const why = payloadProblem(c.dir, { isFile });
-    if (!why) return { dir: c.dir, source: c.source, rejected };
+    if (!why) {
+      const fallback = candidates.find((x) => x.base);
+      return { dir: c.dir, source: c.source, base: fallback?.dir, rejected };
+    }
     rejected.push({ dir: c.dir, source: c.source, why });
   }
-  return { dir: null, source: '', rejected };
+  return { dir: null, source: '', base: candidates.find((x) => x.base)?.dir, rejected };
 }
