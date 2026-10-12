@@ -33,6 +33,7 @@ import {
 const PROBE_TIMEOUT_MS = 6500;
 // Limit simultaneous host TLS/WebSocket handshakes when opening the server list.
 const MAX_SERVER_PROBES = 2;
+const PONG_WAIT_MS = 1200; // protocol RTT sample timeout, independent of handshake
 const isAndroid = () => isAndroidUA(globalThis.navigator?.userAgent);
 
 /**
@@ -147,7 +148,7 @@ export function candidateWsUrls(address) {
 const httpUrlOf = (wsUrl) => wsUrl.replace(/^ws/, 'http').replace(/\/ws$/, '');
 
 /**
- * One attempt: opens /ws (no CORS involved) and reads /healthz when the server allows it.
+ * One attempt: confirms hello/welcome, sends one ping for application RTT, and reads /healthz when allowed.
  * @param {string} wsUrl an address already normalised by candidateWsUrls
  * @returns {Promise<{ ok: boolean, ms: number, info?: object, online: boolean }>} `online` is proven by /healthz
  *          answering over HTTP, which is the only way to tell "wrong server" from "no server" in a browser
@@ -157,8 +158,12 @@ function probeOnce(wsUrl, timeoutMs) {
     const started = Date.now();
     let socket = null;
     let timer = null;
-    let opened = false;
+    let opened = false; // protocol welcome, not merely HTTP 101
     let handshakeFailed = false;
+    let pingSent = null;
+    let rttMs = null;
+    let pongTimer = null;
+    let welcomeApp = '';
     let timedOut = false;
     let settled = false;
     let healthDone = false;
@@ -170,14 +175,15 @@ function probeOnce(wsUrl, timeoutMs) {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (pongTimer) clearTimeout(pongTimer);
       try { socket?.close(); } catch { /* already closed */ }
-      resolve({ ok: opened, ms: Date.now() - started, info, online, timedOut });
+      resolve({ ok: opened, ms: Date.now() - started, rttMs, info, online, timedOut });
     };
 
     // A failed socket is only reported once /healthz has had its say: an instant 403/503 handshake would otherwise
     // always beat the fetch, and '对方在线，但 /ws 没通' is the part the player can act on.
     const fail = () => { handshakeFailed = true; if (healthDone) finish(); else failWait = true; };
-    const healthSettled = () => { healthDone = true; if (failWait) finish(); };
+    const healthSettled = () => { healthDone = true; if (failWait || (opened && rttMs !== null)) finish(); };
 
     timer = setTimeout(() => { timedOut = !opened && !handshakeFailed; finish(); }, timeoutMs);
 
@@ -188,7 +194,10 @@ function probeOnce(wsUrl, timeoutMs) {
         online = true;
         return r.json();
       })
-      .then((json) => { info = json; healthSettled(); }, () => {
+      .then((json) => {
+        info = { ...(json && typeof json === 'object' && !Array.isArray(json) ? json : {}), ...(welcomeApp ? { app: welcomeApp } : {}) };
+        healthSettled();
+      }, () => {
         // No CORS (or an HTML error body): ask again without it. A `no-cors` fetch resolves for *any* HTTP status, so
         // a resolve proves the host is alive; a rejection proves nothing (Android blocks plain http as mixed content).
         fetch(health, { mode: 'no-cors', cache: 'no-store' })
@@ -202,9 +211,36 @@ function probeOnce(wsUrl, timeoutMs) {
       fail();
       return;
     }
-    socket.onopen = () => { opened = true; finish(); };
-    socket.onerror = () => { if (!opened) fail(); };
-    socket.onclose = () => { if (!opened) fail(); };
+    socket.onopen = () => {
+      try {
+        // A proxy's HTTP 101 is not proof that this is a usable game server.
+        // Server protocol requires a numeric rid and a name no longer than 12.
+        socket.send(JSON.stringify({ t: 'hello', rid: 1, name: '探针', version: 1 }));
+      } catch { fail(); }
+    };
+    socket.onmessage = (event) => {
+      let msg;
+      try { msg = JSON.parse(typeof event.data === 'string' ? event.data : ''); } catch { return; }
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.t === 'welcome' && !opened) {
+        opened = true;
+        online = true;
+        if (typeof msg.app === 'string' && msg.app.trim()) { welcomeApp = msg.app.trim(); info = { ...(info || {}), app: welcomeApp }; }
+        pingSent = Date.now();
+        try {
+          socket.send(JSON.stringify({ t: 'ping', c: pingSent }));
+          pongTimer = setTimeout(finish, Math.min(PONG_WAIT_MS, timeoutMs));
+        } catch { finish(); }
+      } else if (msg.t === 'pong' && opened && pingSent !== null && msg.c === pingSent) {
+        rttMs = Math.max(0, Date.now() - pingSent);
+        if (healthDone || info?.app) finish();
+        else { clearTimeout(pongTimer); pongTimer = setTimeout(finish, 350); }
+      } else if (!opened && (msg.t === 'error' || msg.t === 'helloError')) {
+        fail();
+      }
+    };
+    socket.onerror = () => { if (!opened) fail(); else finish(); };
+    socket.onclose = () => { if (!opened) fail(); else finish(); };
   });
 }
 
@@ -408,15 +444,15 @@ function mount() {
     for (const s of list) {
       const st = states.get(s.key) || {};
       const custom = customEntryOf(s.key) != null;
-      const state = st.pending ? '检测中…' : st.ok ? `可连接 · 建连 ${st.ms}ms`
+      const state = st.pending ? '检测中…' : st.ok ? (Number.isFinite(st.rttMs) ? `可连接 · RTT ${st.rttMs}ms` : '协议可用 · RTT 待确认')
         : st.failed ? (st.timedOut ? '探测超时 · 可重试' : st.online ? '主机在线 · WS 未通' : '暂时无法连接') : '';
       // The reason goes on the address line, which wraps; the status column stays one short word.
       const reason = st.pending || st.ok ? '' : probeReason(st);
       const info = st.info
-        ? [st.info.app ? `v${st.info.app}` : '', st.info.humans != null ? `在线 ${st.info.humans}` : '', st.info.rooms != null ? `房间 ${st.info.rooms}` : '']
+        ? [typeof st.info.app === 'string' && st.info.app ? `v${st.info.app.replace(/^v(?=\d)/, '')}` : '', st.info.humans != null ? `在线 ${st.info.humans}` : '', st.info.rooms != null ? `房间 ${st.info.rooms}` : '']
           .filter(Boolean).join(' · ')
         : '';
-      const sub = [info || s.note, reason].filter(Boolean).join(' · ');
+      const sub = [info || s.note, st.ok ? `协议确认 ${st.ms}ms` : '', reason].filter(Boolean).join(' · ');
       const card = document.createElement('div');
       card.className = `sp-pick__card${s.key === selected ? ' is-sel' : ''}`;
       card.innerHTML = `
@@ -461,7 +497,7 @@ function mount() {
       }
       if (epoch !== refreshEpoch) return;
       states.set(entry.key, {
-        ok: result.ok, ms: result.ms, info: result.info, failed: !result.ok,
+        ok: result.ok, ms: result.ms, rttMs: result.rttMs, info: result.info, failed: !result.ok,
         url: result.url, online: result.online, timedOut: result.timedOut, hadPath: result.hadPath,
       });
       renderList();
@@ -473,7 +509,7 @@ function mount() {
 
   /** Refresh without flooding all discovered servers with simultaneous sockets. */
   function refreshAll() {
-    setHint('正在重新检测连接建立耗时（不是游戏内 RTT）…');
+    setHint('正在检测游戏协议与应用层 RTT（短样本；实际对局延迟仍可能波动）…');
     queueRefreshAll();
   }
 
