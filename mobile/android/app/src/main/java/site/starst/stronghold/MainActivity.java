@@ -40,12 +40,15 @@ public class MainActivity extends BridgeActivity {
     private final Set<String> declinedCerts = new HashSet<>();
     /** Hosts whose dialog is on screen: further failures wait for it instead of stacking dialogs. */
     private final Set<String> askingCerts = new HashSet<>();
+    private JsonExportBridge jsonExportBridge;
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         applyImmersive();
+        jsonExportBridge = new JsonExportBridge(this);
+        if (bridge != null) bridge.getWebView().addJavascriptInterface(jsonExportBridge, "StrongholdSaveBridge");
         installCertificatePrompt();
     }
 
@@ -66,6 +69,7 @@ public class MainActivity extends BridgeActivity {
             public void onPageFinished(WebView view, String url) {
                 declinedCerts.clear();
                 super.onPageFinished(view, url);
+                JsonExportBridge.inject(view, getResources(), url);
             }
         });
     }
