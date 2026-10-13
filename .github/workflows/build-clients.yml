@@ -27,7 +27,8 @@ on:
         description: '只验证 Android 构建（减少桌面与 iOS runner 消耗）'
         required: false
         type: boolean
-        default: false      expect_app:
+        default: false
+      expect_app:
         description: '闸门：payload 内 build.json 的 game.app 必须等于此值；留空则要求等于本仓库 package.json 的 version'
         required: false
         default: ''
