@@ -218,7 +218,7 @@ public final class StrongholdLanVpnService extends VpnService {
     /** EasyTier v2.6.4 collectNetworkInfos JSON: map[inst].my_node_info.virtual_ipv4.address.addr. */
     private String assignedIpv4() {
         try {
-            String raw = EasyTierJNI.collectNetworkInfos(10);
+            String raw = EasyTierJNI.collectNetworkInfos();
             if (raw == null || raw.isEmpty()) return null;
             JSONObject root = new JSONObject(raw);
             JSONObject map = root.optJSONObject("map");

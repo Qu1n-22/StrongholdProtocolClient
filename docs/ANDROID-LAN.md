@@ -1,7 +1,7 @@
 # Android 内置 EasyTier（开发分支）
 
-> **验证级别：实现代码 + Node 断言，尚未通过 GitHub Actions 原生库构建与 Android 真机 VPN 测试。**
-> 不可把此分支当成已向玩家交付的功能。现有正式版 v0.2.5-c43 **没有**内置 Android EasyTier。
+> **验证级别：Node、Java/Kotlin JNI ABI 测试通过；GitHub Actions 已成功构建并校验原生 Rust JNI/FFI APK，Android 真机 VPN/实际联机尚未验证。**
+> 不可把此分支当成已向玩家交付的功能。现有正式版 v0.2.5-c44 **没有**内置 Android EasyTier。
 
 ## 目标
 
@@ -32,7 +32,7 @@ Android 首次开启时必须经由系统确认 VPN；这一步不能静默绕�
 6. JNI 本机没签名和安装验证；必须走 GitHub Actions，逐层实测真实 APK。
 7. EasyTier 原生库遵循上游许可；发版须附上上游 LICENSE 与可供替换/重建的源代码版本信息。
 
-## 验收闸门（仍需运行）
+## 验收闸门（前两项已在 CI 验证；第 3—6 项待真机）
 
 1. Node 单测、Android CI 构建成功（Rust JNI / FFI）。
 2. APK 内含两个 \`.so\`、网络配置、\`StrongholdLanBridge\` 页面模块；签名指纹与前版相同。

@@ -43,6 +43,11 @@ test('Android VPN requires explicit user permission and routes only 10.126.126/2
   assert.match(service, /addRoute\(MESH_CIDR, MESH_PREFIX\)/);
   assert.doesNotMatch(service, /addRoute\("0\.0\.0\.0"/);
   assert.match(service, /setTunFd\(INSTANCE, tun\.getFd\(\)\)/);
+  // Official EasyTier v2.6.4 Rust export takes only JNIEnv and JClass.
+  // The upstream example Kotlin wrapper incorrectly documents an extra maxLength arg.
+  const jni = fs.readFileSync(base + '/java/com/easytier/jni/EasyTierJNI.java', 'utf8');
+  assert.match(jni, /native String collectNetworkInfos\(\)/);
+  assert.match(service, /EasyTierJNI\.collectNetworkInfos\(\)/);
   assert.match(service, /startForeground\(/);
   assert.match(bridge, /VpnService\.prepare\(activity\)/);
   assert.match(bridge, /isTrustedLanPage\(\)/);
