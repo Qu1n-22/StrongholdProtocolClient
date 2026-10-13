@@ -279,9 +279,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if entry > 0 {
                             // CI 里没有键盘，所以这一段只问真窗口：命令通道 ↔ 真实窗口之间是这条流水线能证明的部分。
                             // keydown → fetch 那一段由 test/picker.test.js 的源码钉加跨语言路由名比对负责。
-                            // 切两次：既看得见 on 也看得见 off，并且结束时回到原样。
-                            let first = sh.run("fullscreen");
-                            let second = sh.run("fullscreen");
+                            // 切两次：既看得见 on 也看得见 off（探针随即 `exit(0)`，窗口状态不留给谁看）。
+                            //
+                            // ⚠️ 必须**串行**问，而且 `pending` 的语义是"还没答"，不是"答不了"：
+                            // `ShellSlot::run` 只等 500 ms（`recv_timeout`），超时回 `pending` —— 而那时命令
+                            // **已经排上主线程了**，稍后一定会执行。早先这里连发两条、零间隔，慢 runner 上第二条
+                            // 往往在前一条还没被处理完时就被问了（实测：`first=on second=pending`，
+                            // 同时 `first_request_ms` 从 3426 涨到 6134 —— 整台机器都慢），于是把"探针问得太急"
+                            // 误判成"通道坏了"。改成一条拿到确定答复再问下一条：真坏了（`rejected`/`no-window`/
+                            // `error`）照样红，判别力一点没削。
+                            let ask = |cmd: &str| -> String {
+                                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+                                loop {
+                                    let a = sh.run(cmd);
+                                    if a != "fullscreen=pending" || std::time::Instant::now() >= deadline {
+                                        return a;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                }
+                            };
+                            let first = ask("fullscreen");
+                            let second = ask("fullscreen");
                             println!("fullscreen_probe first={first} second={second}");
                             println!(
                                 "boot_probe first_request_ms={} main_js_ms={} requests={} connections={}",
