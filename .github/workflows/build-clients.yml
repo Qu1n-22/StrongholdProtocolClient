@@ -368,10 +368,14 @@ jobs:
       - name: Android 选服页接入原生 LAN 桥
         run: |
           set -euo pipefail
-          test -f build/client/www/js/shell/lanRooms.js
-          cp shell/lanRooms.js build/client/www/js/shell/lanRooms.js
-          cp shell/picker.js build/client/www/js/shell/picker.js
+          # The v0.2.5-c42 payload predates the LAN module. Its absence is expected,
+          # so create the directory and add the module rather than requiring it.
+          test -f build/client/www/js/shell/picker.js
+          mkdir -p build/client/www/js/shell
+          install -m 0644 shell/lanRooms.js build/client/www/js/shell/lanRooms.js
+          install -m 0644 shell/picker.js build/client/www/js/shell/picker.js
           grep -q 'StrongholdLanBridge' build/client/www/js/shell/lanRooms.js
+          grep -q "from './lanRooms.js'" build/client/www/js/shell/picker.js
       # release 而不是 debug：debug 包签的是 runner 现生成的一次性钥匙，每个构建都不同，所以玩家覆盖安装必报
       # INSTALL_FAILED_UPDATE_INCOMPATIBLE(-7)「与已安装应用签名不同」。app/build.gradle 在没有固定钥匙时会
       # 直接失败，不会静默出一个装不上的未签名包。

@@ -64,6 +64,6 @@ test('CI builds pinned EasyTier JNI and FFI, and rejects incomplete APK', () => 
   assert.match(yaml, /node tools\/write-android-lan-config\.mjs --require/);
   assert.match(yaml, /unzip -Z1 "\$APK" \| grep -Fx 'lib\/arm64-v8a\/libeasytier_android_jni\.so'/);
   assert.match(yaml, /unzip -Z1 "\$APK" \| grep -Fx 'assets\/lan-config\.json'/);
-  assert.match(yaml, /cp shell\/lanRooms\.js build\/client\/www\/js\/shell\/lanRooms\.js/);
-  assert.match(yaml, /cp shell\/picker\.js build\/client\/www\/js\/shell\/picker\.js/);
+  assert.match(yaml, /install -m 0644 shell\/lanRooms\.js build\/client\/www\/js\/shell\/lanRooms\.js/);
+  assert.match(yaml, /install -m 0644 shell\/picker\.js build\/client\/www\/js\/shell\/picker\.js/);
 });
