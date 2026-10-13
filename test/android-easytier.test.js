@@ -46,6 +46,11 @@ test('Android VPN requires explicit user permission and routes only 10.126.126/2
   assert.match(service, /startForeground\(/);
   assert.match(bridge, /VpnService\.prepare\(activity\)/);
   assert.match(bridge, /isTrustedLanPage\(\)/);
+  const activity = fs.readFileSync(base + '/java/site/starst/stronghold/MainActivity.java', 'utf8');
+  assert.match(activity, /volatile boolean lanTrustedPage/);
+  assert.match(activity, /onPageStarted\(WebView view, String url, Bitmap favicon\)/);
+  assert.match(activity, /lanTrustedPage = false/);
+  assert.match(activity, /lanTrustedPage = isLocalCapacitorUrl\(url\)/);
   assert.match(manifest, /android\.net\.VpnService/);
   assert.match(manifest, /android\.permission\.BIND_VPN_SERVICE/);
   assert.match(manifest, /FOREGROUND_SERVICE_SPECIAL_USE/);
