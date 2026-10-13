@@ -28,6 +28,13 @@ import {
   addressError, ambiguousScheme, autostartOn, cleanName, customFrom, isAndroidUA, isFullscreenHotkey, isPickerHotkey, missingSeeds, orderCandidates,
   pathOf, probeReason, rootWsUrl, serverName, shellFullscreenUrl, shouldShowPicker, forEachLimited,
 } from './picker-core.js';
+// The second server-list channel (docs/SERVER-LIST.md): ask a server which other servers it recommends. Absent
+// endpoint / no CORS / a dead host are all the same "no answer" and change nothing — see shell/serverList.js.
+import { K_DISMISSED, addDismissed, fetchServers, newServerEntries, parseDismissed, pickServers, serversUrl } from './serverList.js';
+// The virtual-LAN channel: the desktop shell's easytier sidecar answers /lan/* on this same origin, so a player who
+// downloads the exe can play on the LAN without installing anything else. No shell (browser/Android/iOS) = 404 =
+// "this build cannot do LAN play", and the section is hidden — see shell/lanRooms.js.
+import { fetchLanRooms, fetchLanStatus, lanActionLabel, lanEntriesFrom, lanSummary, setLanUp } from './lanRooms.js';
 
 // Cross-region mobile TLS handshakes sometimes need more than four seconds.
 const PROBE_TIMEOUT_MS = 6500;
@@ -112,6 +119,13 @@ function seedCommunityServers() {
   writeItem(K_SEED, String(SEED_VERSION), 'localStorage');
 }
 
+/**
+ * Rooms currently advertised on the virtual LAN, as picker entries. Module-level because `serverList()` (also
+ * module-level, and used by tests) has to see them. Never persisted: a LAN room exists only while its host is
+ * online, so writing it into `K_LIST` would leave the player with dead rows to delete by hand.
+ */
+let lanEntries = [];
+
 /** Every entry the picker lists, de-duplicated on the normalised socket URL. */
 export function serverList() {
   const seen = new Set();
@@ -120,6 +134,7 @@ export function serverList() {
     ...BUILTIN_SERVERS,
     { address: buildDefault(), label: '默认服务器', note: '' },
     ...customServers().map((e) => ({ address: e.address, label: serverName(e), note: '' })),
+    ...lanEntries,
   ];
   for (const s of entries) {
     const key = keyOf(s.address);
@@ -441,6 +456,24 @@ function mount() {
     const goEl = root.querySelector('#sp-go');
     const editEl = root.querySelector('#sp-edit');
     listEl.innerHTML = '';
+    // The virtual-LAN card sits above the server list: it is the one row that is not a server, and for a player who
+    // downloaded the exe it is the way to reach friends' rooms without typing an address. Hidden entirely when this
+    // build has no shell (P1) so the browser build looks untouched.
+    if (lanStatus) {
+      const action = lanActionLabel(lanStatus);
+      const dot = lanStatus.state === 'up' ? 'is-ok' : (lanStatus.state === 'error' ? 'is-bad' : '');
+      const lanCard = document.createElement('div');
+      lanCard.className = 'sp-pick__card sp-pick__card--lan';
+      lanCard.innerHTML = `
+        <div class="sp-pick__dot ${dot}"></div>
+        <div style="min-width:0">
+          <div class="sp-pick__name">联机 · 虚拟局域网</div>
+          <div class="sp-pick__addr">${esc(lanSummary(lanStatus, lanEntries.length))}${lanStatus.hint ? ` · ${esc(lanStatus.hint)}` : ''}</div>
+        </div>
+        <div class="sp-pick__state">${esc(action)}</div>`;
+      if (action) lanCard.addEventListener('click', () => { void toggleLan(); });
+      listEl.appendChild(lanCard);
+    }
     for (const s of list) {
       const st = states.get(s.key) || {};
       const custom = customEntryOf(s.key) != null;
@@ -466,6 +499,9 @@ function mount() {
       card.addEventListener('click', (ev) => {
         if (ev.target.classList.contains('sp-pick__del')) {
           writeItem(K_LIST, JSON.stringify(customServers().filter((e) => toWsUrl(e.address) !== s.key)), 'localStorage');
+          // Remember it too: a runtime /servers.json list may offer this address again on the next launch, and a
+          // deletion the player has to redo every time is not a deletion. (Static seeding keeps using K_SEED.)
+          writeItem(K_DISMISSED, addDismissed(readItem(K_DISMISSED, 'localStorage'), s.key), 'localStorage');
           loadList();
           return;
         }
@@ -523,6 +559,80 @@ function mount() {
     states.clear();
     renderList();
     queueRefreshAll();
+    discoverServers();
+    refreshLanOnce();
+  }
+
+  /** Guards against discovering more than once per launch (the list is re-rendered on every keystroke-sized change). */
+  let discoveryStarted = false;
+
+  /**
+   * The virtual-LAN channel (shell/lanRooms.js). One probe per launch tells us whether this build has a shell that
+   * can run the tunnel; if it does, the card at the top of the list shows its state and, once the tunnel is up, the
+   * rooms the LAN directory is advertising. Deliberately silent on failure: a browser build must look exactly as it
+   * did before, and a dead directory must not add a row the player cannot act on.
+   */
+  let lanStatus = null;
+
+  /** One LAN probe per launch: the card must not re-fetch on every keystroke-sized re-render. */
+  let lanStarted = false;
+
+  function refreshLanOnce() {
+    if (lanStarted) return;
+    lanStarted = true;
+    refreshLan()
+      .then(() => { loadList(); queueRefreshAll(); })
+      .catch(() => { /* no shell, no LAN, no noise */ });
+  }
+
+  async function refreshLan() {
+    lanStatus = await fetchLanStatus();
+    if (!lanStatus) { lanEntries = []; return; } // P1: no shell in this build
+    const rooms = lanStatus.state === 'up' || lanStatus.state === 'degraded' ? await fetchLanRooms(undefined, lanStatus.directoryUrl) : null;
+    lanEntries = rooms ? lanEntriesFrom(rooms) : [];
+  }
+
+  /** Flip the tunnel and re-read both the status and the room list. */
+  async function toggleLan() {
+    const up = lanStatus?.state === 'up' || lanStatus?.state === 'degraded' || lanStatus?.state === 'starting';
+    await setLanUp(!up);
+    await refreshLan();
+    loadList();
+    queueRefreshAll();
+  }
+
+  /**
+   * The second server-list channel (docs/SERVER-LIST.md): ask the server we are about to use for the servers IT
+   * recommends, and append anything new to the player's own list. Deliberately fire-and-forget:
+   *
+   *   * it never blocks entering a game — the box is already usable, this only adds rows later;
+   *   * it runs at most once per launch, never polls and never retries, so a server that just died can never turn
+   *     into a several-second stall on every render;
+   *   * every failure (404, no CORS, timeout, bad JSON) is one outcome — silence. Almost no server on the network
+   *     implements this, and saying so in the UI would be noise;
+   *   * entries the player deleted are skipped (K_DISMISSED) so this cannot resurrect them.
+   */
+  function discoverServers() {
+    if (discoveryStarted) return;
+    discoveryStarted = true;
+    const base = toHttpUrl(selected || buildDefault());
+    const url = serversUrl(base);
+    if (!url) return;
+    fetchServers(url).then((data) => {
+      const picked = pickServers(data, { keyOf: (a) => toWsUrl(a) });
+      if (!picked || !picked.length) return;   // null = "no answer"; [] = "the server knows no others"
+      const existing = customServers();
+      const add = newServerEntries(picked, existing.map((e) => toWsUrl(e.address)), parseDismissed(readItem(K_DISMISSED, 'localStorage')), (a) => toWsUrl(a));
+      if (!add.length) return;
+      // Append, never replace: the seeding's promise (and the player's own edits) stay untouched.
+      writeItem(K_LIST, JSON.stringify(existing.concat(add)), 'localStorage');
+      list = serverList();
+      renderList();
+      for (const s of add) {
+        const found = list.find((e) => e.key === keyOf(s.address));
+        if (found) refresh(found);
+      }
+    });
   }
 
   /**
