@@ -332,7 +332,8 @@ jobs:
           echo "android: /media alias disabled"
 
       # IMPORTANT: cap sync copies build/client/www into app/src/main/assets/public.
-      # Patching the payload AFTER cap sync changes no bytes in the APK!      - name: Android 选服页接入原生 LAN 桥
+      # Patching the payload AFTER cap sync changes no bytes in the APK!
+      - name: Android 选服页接入原生 LAN 桥
         run: |
           set -euo pipefail
           # The v0.2.5-c42 payload predates the LAN module. Its absence is expected,
