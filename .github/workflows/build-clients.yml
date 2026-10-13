@@ -331,6 +331,18 @@ jobs:
           grep -q "__SP_MEDIA_ALIAS__ = false" "$F" || { echo "flag 没写进去"; exit 1; }
           echo "android: /media alias disabled"
 
+      # IMPORTANT: cap sync copies build/client/www into app/src/main/assets/public.
+      # Patching the payload AFTER cap sync changes no bytes in the APK!      - name: Android 选服页接入原生 LAN 桥
+        run: |
+          set -euo pipefail
+          # The v0.2.5-c42 payload predates the LAN module. Its absence is expected,
+          # so create the directory and add the module rather than requiring it.
+          test -f build/client/www/js/shell/picker.js
+          mkdir -p build/client/www/js/shell
+          install -m 0644 shell/lanRooms.js build/client/www/js/shell/lanRooms.js
+          install -m 0644 shell/picker.js build/client/www/js/shell/picker.js
+          grep -q 'StrongholdLanBridge' build/client/www/js/shell/lanRooms.js
+          grep -q "from './lanRooms.js'" build/client/www/js/shell/picker.js
       - name: 同步 web 资源到 Android 工程
         run: cd mobile && npx cap sync android
 
@@ -365,17 +377,6 @@ jobs:
           test -s "$DEST/libeasytier_android_jni.so"
           echo "EasyTier JNI and FFI built from official pinned v2.6.4"
 
-      - name: Android 选服页接入原生 LAN 桥
-        run: |
-          set -euo pipefail
-          # The v0.2.5-c42 payload predates the LAN module. Its absence is expected,
-          # so create the directory and add the module rather than requiring it.
-          test -f build/client/www/js/shell/picker.js
-          mkdir -p build/client/www/js/shell
-          install -m 0644 shell/lanRooms.js build/client/www/js/shell/lanRooms.js
-          install -m 0644 shell/picker.js build/client/www/js/shell/picker.js
-          grep -q 'StrongholdLanBridge' build/client/www/js/shell/lanRooms.js
-          grep -q "from './lanRooms.js'" build/client/www/js/shell/picker.js
       # release 而不是 debug：debug 包签的是 runner 现生成的一次性钥匙，每个构建都不同，所以玩家覆盖安装必报
       # INSTALL_FAILED_UPDATE_INCOMPATIBLE(-7)「与已安装应用签名不同」。app/build.gradle 在没有固定钥匙时会
       # 直接失败，不会静默出一个装不上的未签名包。
