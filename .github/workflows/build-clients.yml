@@ -23,7 +23,11 @@ on:
         description: '校验用：payload 内 runtime-config.js 应当指向的服务器'
         required: false
         default: 'sp.lain42.top'
-      expect_app:
+      android_only:
+        description: '只验证 Android 构建（减少桌面与 iOS runner 消耗）'
+        required: false
+        type: boolean
+        default: false      expect_app:
         description: '闸门：payload 内 build.json 的 game.app 必须等于此值；留空则要求等于本仓库 package.json 的 version'
         required: false
         default: ''
@@ -39,6 +43,7 @@ env:
 jobs:
   # ---------- Windows 桌面版 ----------
   desktop:
+    if: github.event.inputs.android_only != 'true'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -344,6 +349,8 @@ jobs:
           export ANDROID_NDK_HOME="$SDK/ndk/27.2.12479018"
           rustup toolchain install 1.95 --profile minimal
           rustup +1.95 target add aarch64-linux-android
+          sudo apt-get update -qq
+          sudo apt-get install -y protobuf-compiler
           cargo +1.95 install cargo-ndk --locked
           git clone --depth 1 --branch v2.6.4 https://github.com/EasyTier/EasyTier.git /tmp/easytier-android-jni-source
           cd /tmp/easytier-android-jni-source
@@ -430,6 +437,7 @@ jobs:
   # 前面四道闸门与另两个 job 逐字一致（GitHub 的 workflow 不支持 YAML 锚点，所以只能抄；
   # 抄漏一处就是给玩家发一份没把关的包）。
   ios:
+    if: github.event.inputs.android_only != 'true'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
