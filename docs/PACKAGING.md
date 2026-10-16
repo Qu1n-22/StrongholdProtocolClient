@@ -579,7 +579,7 @@ c26 起用 `--latest=false` 创建，并且每次发完都要用 `gh release lis
 
 | 条目 | GitHub runner（海外，干净出口） | 本机（代理） | 处理 |
 |---|---|---|---|
-| 对照 `sp.lain42.top` | `welcome` 5358 ms（→ 8.153.102.122） | `welcome`（本地源码服的阳性对照 17 ms） | — |
+| 对照 （**已停服**，2026-10-16） | `welcome` 5358 ms（→ 8.153.102.122） | `welcome`（本地源码服的阳性对照 17 ms） | — |
 | linxia / nekotc / chiruno / ausevaywstr | `welcome` 1076–8395 ms | `welcome` 561–1387 ms | 保留（两个出口都通过） |
 | **103.205.253.194:27527** | `welcome` 1440 ms | `welcome` 53 ms | **本次新增**，`SEED_VERSION` 2→3 |
 | 183.66.27.19:20522 | `TCP 超时` 15496 ms | `welcome` 108 ms | 保留 —— 海外连不到那个端口，直连 IP 那一侧是有效测量 |

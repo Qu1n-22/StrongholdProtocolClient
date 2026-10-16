@@ -121,7 +121,7 @@ cp -a  /opt/Stronghold-Protocol/data/local-assets.json data/local-assets.json
 
 # 3) 生成 payload（--server 会写进 js/runtime-config.js）
 cd /opt/sp-client
-node tools/package-client.mjs --game /opt/sp-game-src --out /tmp/sp-payload/www --server sp.lain42.top
+node tools/package-client.mjs --game /opt/sp-game-src --out /tmp/sp-payload/www --server http://150.158.38.174:3000/
 
 # 4) 打包上传
 tar -czf /var/tmp/sp-client-payload.tar.gz -C /tmp/sp-payload/www .
@@ -143,7 +143,7 @@ gh release upload payload-v0.2.0-c21 -R lilyco-42/StrongholdProtocolClient sp-cl
 # 再用它的下载直链触发三端；expect_app 会跟 payload 的 build.json.app 对，对不上就红
 gh workflow run build-clients.yml -R lilyco-42/StrongholdProtocolClient --ref feat/payload-assets \
   -f payload_url=https://github.com/lilyco-42/StrongholdProtocolClient/releases/download/payload-v0.2.0-c21/sp-client-payload-0.2.0-c21.tar.gz \
-  -f expect_app=0.2.0 -f server=sp.lain42.top
+  -f expect_app=0.2.0 -f server=http://150.158.38.174:3000/
 
 # 跟完 + 取产物（--json artifacts 不是合法字段，用 run download -D）
 gh run watch <run-id> -R lilyco-42/StrongholdProtocolClient --exit-status
@@ -223,7 +223,7 @@ PORT=8138 node <静态宿主> <payload 目录>
 `build.json` 记录了构建来源，可在客户端内查：
 
 ```json
-{ "server": "sp.lain42.top",
+{ "server": "http://150.158.38.174:3000/",
   "game": { "app": "0.1.1", "protocol": 1, "commit": "8b10625d3cce...", "dirty": false } }
 ```
 
