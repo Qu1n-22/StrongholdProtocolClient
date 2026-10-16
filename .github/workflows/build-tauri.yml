@@ -20,7 +20,7 @@ on:
       server:
         description: '校验用：payload 内 runtime-config.js 应当指向的服务器'
         required: false
-        default: 'sp.lain42.top'
+        default: 'http://150.158.38.174:3000/'
       expect_app:
         description: '闸门：payload 内 build.json 的 game.app 必须等于此值；留空则要求等于本仓库 package.json 的 version'
         required: false

@@ -77,7 +77,7 @@
 
 房间目录服务在运维仓 `extensions/sp-lan-directory/`，读 `easytier-cli peer` 的输出 →
 按 CIDR 过滤 → 并发探每个 peer 的 `:5150/healthz` → 汇总成一份只读 JSON，
-挂在 `https://sp.lain42.top/api/lan/v1/rooms`。它**只回环监听**（`127.0.0.1:5188`），
+挂在 `http://150.158.38.174:3000/api/lan/v1/rooms`。它**只回环监听**（`127.0.0.1:5188`），
 由 pingap 转出去。
 
 ---

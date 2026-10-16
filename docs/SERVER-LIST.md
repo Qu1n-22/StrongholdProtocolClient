@@ -150,9 +150,9 @@ caps 为空数组 [] ⟹  「明确不支持任何扩展能力」
 
 客户端有两种运行形态：
 
-| 形态 | 页面源 | 请求 `https://sp.lain42.top/servers.json` |
+| 形态 | 页面源 | 请求 `http://150.158.38.174:3000/servers.json` |
 |---|---|---|
-| 浏览器直连网页 | `https://sp.lain42.top` | **同源**，本来就没问题 |
+| 浏览器直连网页 | `http://150.158.38.174:3000` | **同源**，本来就没问题 |
 | 打包客户端（exe / apk / ipa） | `file://` 或 `http://127.0.0.1:47821` | **跨域** |
 
 而客户端今天读 `/healthz` 的写法（`picker.js:163`）是：
@@ -230,7 +230,7 @@ caps 为空数组 [] ⟹  「明确不支持任何扩展能力」
 
 沿用 `AGENTS.md` §6：
 
-1. **接口级**：`curl -i https://sp.lain42.top/servers.json` → `200` + `Content-Type: application/json`
+1. **接口级**：`curl -i http://150.158.38.174:3000/servers.json` → `200` + `Content-Type: application/json`
    + `Access-Control-Allow-Origin: *` + `Cache-Control: no-store`。
 2. **无配置时的降级**：临时移走 `data/servers.json` → 必须 **404**（不是 500、不是空对象）。
 3. **跨域实测**：从 `file://` 打开的页面里 `fetch(...)`，**必须读到 body**（不是 `TypeError: Failed to fetch`）。

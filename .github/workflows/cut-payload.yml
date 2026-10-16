@@ -41,7 +41,7 @@ on:
       server:
         description: '写进 js/runtime-config.js 的默认服务器(发出去的产物要指向它)'
         required: false
-        default: 'sp.lain42.top'
+        default: 'http://150.158.38.174:3000/'
       out_tag:
         description: 'publish 非 no 时新建的 Release tag(必须是还不存在的名字,绝不覆盖已发布资产)'
         required: false

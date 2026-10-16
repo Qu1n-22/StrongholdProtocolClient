@@ -25,7 +25,7 @@
 
 ```bash
 # 1) 生成 payload（在素材齐全的游戏 checkout 上；只有这一步在本机/服务器做）
-node tools/package-client.mjs --server sp.lain42.top --game <游戏仓库checkout> --out <dir>
+node tools/package-client.mjs --server http://150.158.38.174:3000/ --game <游戏仓库checkout> --out <dir>
 #    → build.json 记录 game.app / commit / dirty；素材来自 git（不进 repo）需 `npm run assets`
 tar -czf payload.tar.gz -C <dir> .            # 布局：./index.html ./js ./assets …（CI 直接 tar -xzf）
 

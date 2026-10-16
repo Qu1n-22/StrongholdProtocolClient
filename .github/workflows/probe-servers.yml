@@ -25,7 +25,7 @@ on:
       control:
         description: '阳性对照地址（已知会回 welcome 的服务器）'
         required: false
-        default: 'https://sp.lain42.top'
+        default: 'http://150.158.38.174:3000/'
       extra:
         description: '候选地址，每行一条 "名字=https://host/"，不影响退出码'
         required: false
@@ -51,7 +51,7 @@ jobs:
         run: |
           set -euo pipefail
           node -e 'const a=require("os").networkInterfaces();for(const[n,l]of Object.entries(a))for(const x of l)if(x.family==="IPv4")console.log(n,x.address)'
-          getent hosts sp.lain42.top || echo "（本机解析不到 sp.lain42.top）"
+          getent hosts 150.158.38.174 || echo "（本机解析不到 150.158.38.174）"
 
       - name: 探测种子列表（hello→welcome）
         env:

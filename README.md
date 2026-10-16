@@ -2,7 +2,7 @@
 
 把《卫戍协议：盟约》的浏览器客户端打成 **Windows 客户端**（Electron）和 **Android `.apk`**（Capacitor）：素材与代码从本地读（进对局不用重新下载约 260 MB 素材），房间、回合、联机仍然走服务器。
 
-`tools/package-client.mjs` 的代码默认值是 `localhost:3000`（自己开服用），但**发出去的产物不用它**：CI 打包时传 `--server sp.lain42.top`，所以你现在下载的 exe/apk 里那份 `js/runtime-config.js` 写的是 `globalThis.__SP_SERVER__ = "sp.lain42.top"`（2026-10-05 从发布 APK 里解出来核过）。想临时换服务器用 `--server <地址>` 或 `?server=`。
+`tools/package-client.mjs` 的代码默认值是 `localhost:3000`（自己开服用），但**发出去的产物不用它**：CI 打包时传 `--server http://150.158.38.174:3000/`，所以你现在下载的 exe/apk 里那份 `js/runtime-config.js` 写的是 `globalThis.__SP_SERVER__ = "http://150.158.38.174:3000/"`（0.3.0 起；此前是已下线的 `sp.lain42.top`）。想临时换服务器用 `--server <地址>` 或 `?server=`。
 
 游戏本体（Node 服务器 + 浏览器客户端，GPL-3.0）是**另一个仓库**：上游 <https://github.com/sganggs/Stronghold-Protocol>。
 本仓库只放"壳"和打包流程，**从不修改游戏仓库**——客户端要的那 3 处改动以补丁形式打在 payload 上（见下）。

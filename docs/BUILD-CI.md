@@ -36,7 +36,7 @@
 
 两个 job 全部成功，产物已下载校验：`stronghold-desktop-win` 315.6 MB / 4994 条目、
 `stronghold-android-apk` 193.0 MB / 4634 条目（当时 4196 个内嵌 web 资源）。
-两者的 `runtime-config.js` 都是 `globalThis.__SP_SERVER__ = "sp.lain42.top"` ✓
+两者的 `runtime-config.js` 都是 `globalThis.__SP_SERVER__ = "http://150.158.38.174:3000/"` ✓
 
 **注意：客户端的 `index.html` 里是 `/js/main.js`（本地路径），不是 OSS 地址。**
 这是**正确的** —— 客户端把全部资源内嵌（4972 / 4196 个文件），
