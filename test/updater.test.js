@@ -106,6 +106,7 @@ function makeIo() {
     countFiles: (d) => { const q = norm(d); let n = 0; for (const f of files.keys()) if (f.startsWith(`${q}/`)) n++; return n; },
     hashFile: (p) => createHash('sha256').update(files.get(norm(p)) ?? Buffer.alloc(0)).digest('hex'),
     linkDir: (target, linkPath) => { links.set(norm(linkPath), norm(target)); },
+    realpath: (p) => links.get(norm(p)) || norm(p),
   };
   return io;
 }
@@ -517,15 +518,34 @@ describe('runUpdate 端到端', () => {
     await runUpdate({ payloadDir: PAYLOAD, artDir: ART, io: f.io, fetchImpl: f.fetch, now: () => 1 });
     assert.equal(f.io.files.get(`${PAYLOAD}/current/index.html`).toString(), '<html></html>');
     // 第二次（换一刀）时把 rename 弄坏：旧的那份必须原样留下。
+    // 注意：必须还是同一个 io 实例（只覆盖 rename）—— 换一个实例的话第二次根本没写进被断言的那张表，
+    // 这条会变成假绿（第一版就是这么写的）。
     const second = fixture({ cut: 'payload-v0.3.1-c47', files: codePayload({ 'index.html': '<html>new</html>' }) });
-    const merged = { ...second.io, files: f.io.files, dirs: f.io.dirs, links: f.io.links };
-    merged.rename = (a, b) => {
-      if (b.includes(`${PAYLOAD}/current`)) throw new Error('EPERM');
-      return f.io.rename(a, b);
+    const broken = {
+      ...f.io,
+      rename: (a, b) => {
+        if (a.includes('.staging-')) throw new Error('EPERM');
+        return f.io.rename(a, b);
+      },
     };
-    const r = await runUpdate({ payloadDir: PAYLOAD, artDir: ART, io: merged, fetchImpl: second.fetch, now: () => 2 });
+    const r = await runUpdate({ payloadDir: PAYLOAD, artDir: ART, io: broken, fetchImpl: second.fetch, now: () => 2 });
     assert.equal(r.status, 'error');
     assert.equal(f.io.isFile(`${PAYLOAD}/current/index.html`), true, '换失败后 current 还在');
     assert.equal(f.io.files.get(`${PAYLOAD}/current/index.html`).toString(), '<html></html>', '还是旧那份');
+  });
+
+  test('a second update links the art to the real directory, never to the previous link', async () => {
+    const f = fixture();
+    await runUpdate({ payloadDir: PAYLOAD, artDir: ART, io: f.io, fetchImpl: f.fetch, now: () => 1 });
+    assert.equal(f.io.links.get(`${PAYLOAD}/current/assets`), ART);
+    // 这一次的 artDir 是**上一次留下的链接**（overlay 的 assets）。链接到一个链接，等旧 overlay 被清掉
+    // 就是断链 —— 玩家看到的是"更新完没立绘"。
+    const second = fixture({ cut: 'payload-v0.3.1-c47', files: codePayload({ 'index.html': '<html>v2</html>' }) });
+    const r = await runUpdate({
+      payloadDir: PAYLOAD, artDir: `${PAYLOAD}/current/assets`, io: f.io, fetchImpl: second.fetch, now: () => 2,
+    });
+    assert.equal(r.status, 'applied');
+    assert.equal(f.io.links.get(`${PAYLOAD}/current/assets`), ART, '链接目标必须是解析后的真实目录');
+    assert.equal(f.io.files.get(`${PAYLOAD}/current/index.html`).toString(), '<html>v2</html>');
   });
 });

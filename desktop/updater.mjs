@@ -20,7 +20,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
-  existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
+  existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 
 import { safeJoin, untarGzip } from './tar.mjs';
@@ -256,6 +256,8 @@ export const fsIo = {
   },
   hashFile: (p) => createHash('sha256').update(readFileSync(p)).digest('hex'),
   linkDir: (target, linkPath) => symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir'),
+  /** 链接指向的真实目录（Windows junction / POSIX symlink 都算）。 */
+  realpath: (p) => realpathSync(p),
 };
 
 /**
@@ -301,8 +303,13 @@ export async function runUpdate({
   if (!pointer) return done('no-pointer', { why: parsed.why || '所有指针源都取不到' });
 
   // ── 2. 判定：壳够不够新、是不是已经这一刀、美术对不对 ────────────────────────────────────────────────
+  // 手里这份 payload 的 assets 可能已经是**上一次更新留下的目录链接**。链接到一个链接，等旧 overlay 被清掉
+  // 就成了断链（玩家看到的是"更新完没立绘"），所以先解析到真实目录：链接目标、指纹缓存的键都用它。
+  let artRoot = artDir;
+  try { if (typeof io.realpath === 'function') artRoot = io.realpath(artDir) || artDir; } catch { /* 断链：原样用 */ }
+  if (artRoot !== artDir) log(`[update] 美术目录是链接 → 解析到 ${artRoot}`);
   const cacheFile = path.join(payloadDir, ART_CACHE_FILE);
-  const local = localArtDigest({ artDir, cacheFile, io, env });
+  const local = localArtDigest({ artDir: artRoot, cacheFile, io, env });
   const appliedCut = readAppliedCut({ overlayDir: path.join(payloadDir, CURRENT_LINK), io });
   log(`[update] 本地美术指纹 ${local.digest ? `${local.digest.slice(0, 12)}…（${local.from}）` : '（算不出）'}；已应用 ${appliedCut || '（无）'}`);
   const verdict = decide({ pointer, shellProtocol, localArt: local.digest, appliedCut });
@@ -350,7 +357,7 @@ export async function runUpdate({
       return done('bad-archive', { why: '解出来不像 payload（缺 index.html 或 build.json）', cut: pointer.cut });
     }
     // 增量里没有美术：把它接回现在这份（装机内置那份不会被本模块删掉，所以链接它最稳）。
-    if (io.isDir(artDir)) io.linkDir(artDir, path.join(stagedPath, 'assets'));
+    if (io.isDir(artRoot)) io.linkDir(artRoot, path.join(stagedPath, 'assets'));
     io.writeJson(path.join(stagedPath, APPLIED_FILE), {
       schema: 1,
       cut: pointer.cut,
