@@ -33,7 +33,7 @@ on:
       game_ref:
         description: '游戏仓要打包的分支或 commit'
         required: true
-        default: 'feat/skins'
+        default: 'deploy/prod'
       base_payload_release:
         description: '素材来自哪个已发布 payload Release 的 tar(补齐过的那批)'
         required: false

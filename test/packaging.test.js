@@ -1004,7 +1004,7 @@ describe('payload offline gate (no third-party host in the boot path)', () => {
     const otherSite = withTitle('export const T = () => `<a href="https://github.com/evil/thing">x</a>`;\n');
     assert.match(otherSite.problems.join('\n'), /会向站外发请求/, '别的地址的 <a> 必须拦 —— 白名单不是放行整类 href');
 
-    assert.equal(ALLOWED_NAV.size, 1, '白名单只该有这一条；加新条目要同时改 tools 里的注释与这条断言');
+    assert.equal(ALLOWED_NAV.size, 2, '白名单只该有这两条（标题页 / 插件工作台各一条）；加新条目要同时改 tools 的注释、这条断言，以及游戏仓 test/webfonts-local.test.js 的 ALLOWED');
   });
 
   test('a CDN-absolute manifest fails (offline play is the point of an exe/apk)', () => {

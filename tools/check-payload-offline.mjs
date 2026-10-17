@@ -54,12 +54,19 @@ export const OUTBOUND = [
  *
  * 只对下面这份**确切 URL** 白名单放行 —— 放行整类 href、或放行整个 github.com，闸门就形同虚设了。
  *
- * 目前只有一条：上游 0.2.5 在标题页加的「项目仓库」链接（`public/js/screens/title.js`），
- * 带 `target="_blank" rel="noopener noreferrer"`；不点它不会有任何网络行为，离线启动不受影响。
- * （0.2.5 的 cut 就是在这里红的：闸门把它当成了"会向站外发请求"。）
+ * 目前两条，都是 `target="_blank" rel="noopener noreferrer"` 的导航链接：
+ *   1. 上游 0.2.5 标题页的「项目仓库」（`public/js/screens/title.js`）；不点它没有任何网络行为，
+ *      离线启动不受影响。（0.2.5 的 cut 就是在这里红的：闸门把它当成了"会向站外发请求"。）
+ *   2. 上游 0.3.0 插件工作台（`public/studio/js/main.js`）顶栏的「新手指南」，同类。
+ *
+ * ⚠️ 游戏仓 `test/webfonts-local.test.js` 的 `ALLOWED` 是**同一套判据**（它自己有条 `ALLOWED.size === 2`
+ * 的自检），改这里必须同时改那边，否则切包时要在这边再红一次 —— 0.2.5 的 cut 就是这么红的。
  */
 export const ANCHOR_NAV = /<a\b[^>]*\bhref\s*=\s*["']((?:https?:)?\/\/[^"'\s]+)/gi;
-export const ALLOWED_NAV = new Set(['https://github.com/sganggs/Stronghold-Protocol']);
+export const ALLOWED_NAV = new Set([
+  'https://github.com/sganggs/Stronghold-Protocol',
+  'https://github.com/sganggs/Stronghold-Protocol/blob/master/docs/PLUGIN-GUIDE.md',
+]);
 
 /** Text formats that can carry a URL. Binary assets (.png/.woff2/.skel/.mp3 …) are not scanned. */
 export const TEXT_EXT = new Set(['.html', '.css', '.js', '.mjs', '.json', '.svg', '.txt', '.atlas', '.csv']);
