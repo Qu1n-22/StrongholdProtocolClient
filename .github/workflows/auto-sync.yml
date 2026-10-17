@@ -24,13 +24,14 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: 'report=只量不推（默认）/ branch=合并干净时把结果推到 auto/ 分支'
+        description: 'report=只量不推（默认）/ branch=干净时推 auto/ 分支 / auto=干净且套件绿时自动合进服务端上线分支'
         required: false
         default: 'report'
         type: choice
         options:
           - 'report'
           - 'branch'
+          - 'auto'
       game_repo:
         description: '我们的 fork(owner/name)'
         required: false
@@ -43,24 +44,39 @@ on:
         description: '从哪条分支出发做合并（只读，不会推回它）'
         required: false
         default: 'feat/skins'
+      live_ref:
+        description: 'auto 模式合进哪条分支（服务端的 deploy hook / timer 拉的就是它）'
+        required: false
+        default: 'deploy/prod'
+      payload_release:
+        description: '跑游戏套件要用的 payload Release（留空=自动取最新的 payload-* tag）'
+        required: false
+        default: ''
   schedule:
     - cron: '37 18 * * *'   # 每天一次（UTC 18:37 ≈ 北京 02:37），错开整点
 
 # schedule 跑的时候 inputs 全是空字符串，直接用 inputs.repository 会让 checkout 拿到空值、
 # 每晚红一次却没人看。所有引用都走下面这份带默认值的 env。
 env:
+  NODE_VERSION: '22'
   GAME_REPO: ${{ inputs.game_repo || 'lilyco-42/Stronghold-Protocol' }}
   UPSTREAM_REPO: ${{ inputs.upstream_repo || 'sganggs/Stronghold-Protocol' }}
   BASE_REF: ${{ inputs.base_ref || 'feat/skins' }}
   MODE: ${{ inputs.action || 'report' }}
+  LIVE_REF: ${{ inputs.live_ref || 'deploy/prod' }}
+  PAYLOAD_RELEASE: ${{ inputs.payload_release || '' }}
+  # auto 模式的**最后一道**开关：置 off 时整套动作照跑（合并、装依赖、跑套件），但一次性也不推。
+  # 出错/出坏包时的止损是一个仓库变量，不用改 YAML —— 这条比"改代码再回滚"快一个数量级。
+  AUTO_SYNC_LIVE: ${{ vars.AUTO_SYNC_LIVE || 'off' }}
 
 permissions:
-  contents: write   # 只有 branch 模式会推，而且只推 auto/ 分支；report 模式（schedule）一个对象都不写
+  contents: write   # auto 模式才会写（合进 LIVE_REF），report（schedule）一个对象都不写
+  issues: write     # 需要人处理的那些刀落成 issue，而不是安静红色
 
 jobs:
   measure:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60   # auto 模式要多一步：拉 1 GB 素材 + 跑完整游戏套件（report 模式通常 1 分钟内完事）
     steps:
       - name: checkout 我们的 fork（带全历史与 tag，合并要算 merge base）
         uses: actions/checkout@v4
@@ -78,6 +94,10 @@ jobs:
         with:
           path: client
           fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
 
       - name: 取最上游，找出最新的 release tag
         id: up
@@ -249,6 +269,147 @@ jobs:
           echo "remote=$REMOTE"
           test "$REMOTE" = "$LOCAL" || { echo "推完在远端没看到 $BR（或 sha 不一致）"; exit 1; }
           echo "✓ 推了 $BR —— 下一步：用 test-game-branch 跑它，再 cut-payload --game_ref $BR"
+
+      # ---------------------------------------------------------------------------------------------------------------
+      # auto 模式：把手从"上游发版 → 服务端上线"这一段里撤出来。
+      #
+      # 门槛是四道，缺一道就什么都不推 —— 这一条 lane 推的是**服务端上线分支**，推完几分钟就有 300 多个玩家
+      # 在用，所以这里的每一行都比"想省事"重要：
+      #   1) 严格合并零冲突（report 那一跑已经量过一遍，这里对 LIVE_REF 再量一遍：两条树的冲突不是同一个数）
+      #   2) patches/game-client.patch 在合并结果上打得上（这是自动出包真正会红的那一处）
+      #   3) 游戏仓完整 npm test 绿 —— 照抄 test-game-branch.yml 的那套：补素材 → 补增量素材 → npm test
+      #   4) 仓库变量 AUTO_SYNC_LIVE=on（止损开关：出错时不用改 YAML，改一个变量就停）
+      # 前三道里任何一道不过 → 落成 issue 等人。日常那种"上游加了点东西"的版本会自动走完，人要处理的只剩真冲突。
+      # ---------------------------------------------------------------------------------------------------------------
+      - name: 'auto：合进服务端上线分支 → 跑完整游戏套件 → 绿了才推'
+        if: |
+          steps.up.outputs.up_to_date == 'no' && env.MODE == 'auto'
+          && steps.try.outputs.conflicts == '0' && steps.try.outputs.patch == 'ok'
+        id: auto
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW: ${{ steps.up.outputs.newest }}
+          LIVE: ${{ env.LIVE_REF }}
+          AUTO_SYNC_LIVE: ${{ env.AUTO_SYNC_LIVE }}
+          GAME: ${{ github.workspace }}/game
+        run: |
+          set -euo pipefail
+          cd "$GAME"
+          git config user.name 'auto-sync (auto)'; git config user.email 'auto-sync@invalid'
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git fetch -q --tags upstream
+          git fetch -q origin "$LIVE"
+          git checkout -B "$LIVE" "origin/$LIVE"
+          echo "服务端上线分支 $LIVE 现在是 $(git rev-parse --short HEAD)"
+
+          PREV_ONLINE=$(git rev-parse HEAD)
+          echo "PREV_HEAD=$PREV_ONLINE" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$NEW" HEAD; then
+            echo "$LIVE 已经包含上游 $NEW —— 这一跑无事可做"
+            echo "outcome=already" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 又严一遍：被测的树（BASE_REF）和要推的树（LIVE_REF）不是同一棵，冲突数必须在这一棵上重算。
+          rc=0
+          git merge --no-edit --no-commit "$NEW" >/tmp/auto-merge.out 2>&1 || rc=$?
+          U=$(git diff --name-only --diff-filter=U | grep -c . || true)
+          if [ "$U" != "0" ]; then
+            git merge --abort 2>/dev/null || true
+            echo "合进 $LIVE 时出现 $U 个冲突 —— 什么都不推"
+            git diff --name-only --diff-filter=U | sed 's/^/  U /'
+            echo "outcome=conflict" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git commit -m "auto-sync: merge upstream ${NEW}（零冲突，自动化 lane）" >/dev/null
+          echo "✓ 合进 $LIVE：$(git rev-parse --short HEAD)"
+
+          # ---- 跑完整游戏套件（同 test-game-branch.yml：素材 → 增量素材 → npm test） ----
+          REL="${PAYLOAD_RELEASE}"
+          if [ -z "$REL" ]; then
+            REL=$(gh release list -R lilyco-42/StrongholdProtocolClient --limit 30 --json tagName \
+                  --jq '.[]|select(.tagName|startswith("payload-"))|.tagName' | head -1)
+          fi
+          test -n "$REL" || { echo "找不到 payload-* Release，套件没法跑（素材在 git 外面）"; echo "outcome=no-payload" >> "$GITHUB_OUTPUT"; exit 1; }
+          echo "素材来源：$REL"
+          mkdir -p "$RUNNER_TEMP/payload"
+          gh release download "$REL" -R lilyco-42/StrongholdProtocolClient -D "$RUNNER_TEMP/payload" -p '*.tar.gz'
+          tar=$(ls "$RUNNER_TEMP/payload"/*.tar.gz | head -1)
+          mkdir -p "$RUNNER_TEMP/www"
+          tar -xzf "$tar" -C "$RUNNER_TEMP/www"
+          test -f "$RUNNER_TEMP/www/data/assets.json"
+          for d in assets fonts vendor; do
+            if [ -d "$RUNNER_TEMP/www/$d" ]; then mkdir -p "public/$d"; cp -a "$RUNNER_TEMP/www/$d/." "public/$d/"; fi
+          done
+          if [ -f "$RUNNER_TEMP/www/data/local-assets.json" ]; then cp "$RUNNER_TEMP/www/data/local-assets.json" data/local-assets.json; fi
+          A=$(find public/assets -type f | wc -l); V=$(find public/vendor -type f | wc -l)
+          echo "素材 assets=$A vendor=$V"
+          test "$A" -gt 10000 || { echo "素材没拷够 —— 跑出来的套件不去信"; echo "outcome=bad-art" >> "$GITHUB_OUTPUT"; exit 1; }
+
+          npm install --ignore-scripts --no-audit --no-fund
+          # ext-surface 那条 "no unrecorded mount points" 要 upstream/master 这个 ref，没有它是直接抛的
+          # （它不是红在合并上，而是红在环境上 —— 5782 项里那唯一一条就是它）。
+          git fetch --no-tags --depth 1 upstream master
+          git update-ref refs/remotes/upstream/master FETCH_HEAD
+          node tools/fetch-assets.mjs 2>&1 | tail -10 || echo "（fetch-assets 失败：让下面的套件去判，别在这里掩盖）"
+
+          rc2=0
+          npm test > "$RUNNER_TEMP/npm-test.log" 2>&1 || rc2=$?
+          echo "npm test 退出码 = $rc2"
+          grep -E "^# (tests|pass|fail|cancelled|skipped|todo) " "$RUNNER_TEMP/npm-test.log" || true
+          echo "--- 失败的用例 ---"
+          grep -nE "^ *not ok [0-9]+ - " "$RUNNER_TEMP/npm-test.log" | head -40 || true
+          if [ "$rc2" != "0" ]; then
+            echo "游戏套件红（$rc2）—— 一个字节都不推"
+            echo "outcome=tests-red" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # ---- 三道都过了：AUTO_SYNC_LIVE 决定推不推 ----
+          if [ "${AUTO_SYNC_LIVE}" != "on" ]; then
+            echo "✓ 合并 + 套件全绿，但 AUTO_SYNC_LIVE=${AUTO_SYNC_LIVE}（默认 off）—— 什么都没推。"
+            echo "  想让它真自动上线：Settings → Variables 里加 AUTO_SYNC_LIVE=on。"
+            echo "  要这一刀：进 game/ 手动合 $(git rev-parse --short HEAD)，或把 AUTO_SYNC_LIVE 设成 on 重跑本 lane。"
+            echo "outcome=gated" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin "HEAD:refs/heads/$LIVE"
+          REMOTE=$(git ls-remote origin "refs/heads/$LIVE" | cut -f1)
+          LOCAL=$(git rev-parse HEAD)
+          test "$REMOTE" = "$LOCAL" || { echo "推完远端没看到 $LOCAL（$REMOTE）—— 别当成成功"; echo "outcome=push-unverified" >> "$GITHUB_OUTPUT"; exit 1; }
+          echo "outcome=pushed" >> "$GITHUB_OUTPUT"
+          echo "✓ 已推 $LIVE @ $LOCAL —— 服务端的 deploy hook/timer 会在几分钟内把这一刀上线"
+          echo "  回滚：git fetch origin && git reset --hard $PREV_ONLINE && git push --force-with-lease origin HEAD:refs/heads/$LIVE"
+
+      # 只有上面失败那几类（冲突 / 套件红 / 缺素材）才有这一步：常规版本不用人造访。
+      - name: 需要人处理时落成 issue
+        if: failure() && steps.auto.outputs.outcome != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OUTCOME: ${{ steps.auto.outputs.outcome }}
+          NEWEST: ${{ steps.up.outputs.newest }}
+          LIVE: ${{ env.LIVE_REF }}
+          PREV: ${{ steps.auto.outputs.PREV_HEAD }}
+          REPORT: ${{ runner.temp }}/auto-sync-report.md
+        run: |
+          set -euo pipefail
+          TITLE="auto-sync 需要人：上游 ${NEWEST} 没能自动合进 ${LIVE}"
+          BODY="自动 lane 跑到 \`${OUTCOME}\` 就停了，**没有推任何东西**，服务端仍在线上原来那一刀。
+
+          - 上游那一刀：\`${NEWEST}\`
+          - 目标分支：\`${LIVE}\`（回滚基线 \`${PREV:-（未知）}\`）
+          - 流水线：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          怎么办：本地进入游戏仓 → \`git fetch --tags upstream && git merge <那一刀>\` → 手工解冲突 →
+          游戏仓 \`npm test\` 绿了 → 推 \`${LIVE}\`。辅助材料见本 run 的 \`auto-sync-report\`。"
+          EXISTING=$(gh issue list -R "${{ github.repository }}" --label auto-sync --state open --limit 1 --json number --jq '.[0].number // ""')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment -R "${{ github.repository }}" "$EXISTING" --body "$BODY"
+            echo "已追加到既有 issue #$EXISTING"
+          else
+            gh label create auto-sync --force -R "${{ github.repository }}" >/dev/null
+            gh issue create -R "${{ github.repository }}" --title "$TITLE" --label auto-sync --body "$BODY"
+          fi
 
       - name: 存档报告
         if: always()
