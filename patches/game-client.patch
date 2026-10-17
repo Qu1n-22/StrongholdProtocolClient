@@ -2,17 +2,17 @@ diff --git a/public/index.html b/public/index.html
 index 82a085e..360d735 100644
 --- a/public/index.html
 +++ b/public/index.html
-@@ -42,2 +42,4 @@
+@@ -50,2 +50,4 @@
    <link rel="stylesheet" href="/css/devices.css" />
 +  <!-- Packaged clients: HUD scale on short landscape screens (see shell/display.css). -->
 +  <link rel="stylesheet" href="/css/shell-display.css" />
  
-@@ -95,2 +97,5 @@
-   </script>
+@@ -85,2 +87,5 @@
+   <script src="/js/boot.js"></script>
 +  <!-- Packaged-client server address (empty in the web build → the page's own origin). Must run before /js/main.js. -->
 +  <script src="/js/runtime-config.js"></script>
 +  <script type="module" src="/js/shell/picker.js"></script>
-   <script type="module" src="/js/main.js" onerror="window.__spBootFail && window.__spBootFail('load')"></script>
+   <script type="module" src="/js/main.js" id="sp-main"></script>
 diff --git a/public/js/net.js b/public/js/net.js
 index ce2d362..b9afbf8 100644
 --- a/public/js/net.js
@@ -116,10 +116,12 @@ diff --git a/public/js/screens/room.js b/public/js/screens/room.js
 index d3729e4..d505054 100644
 --- a/public/js/screens/room.js
 +++ b/public/js/screens/room.js
-@@ -22,7 +22,7 @@ import { GuideButton } from '../ui/guide.js';
+@@ -27,9 +27,9 @@ import { GuideButton } from '../ui/guide.js';
  import { openStats } from './stats.js';
  import { SettingsButton } from '../ui/settings.js';
  import { LoadoutButton } from './loadout.js';
+ import { PluginTag, isModdedRoom } from '../ui/pluginTag.js';
+ import { hasScriptConsent, rememberScriptConsent } from '../content.js';
 -import { net } from '../net.js';
 +import { net, resolveServerTarget, toHttpUrl } from '../net.js';
  import { store, useStore, shallowEqual, emptyMatch, isSpectating } from '../store.js';
