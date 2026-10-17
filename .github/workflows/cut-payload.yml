@@ -316,3 +316,44 @@ jobs:
           gh release upload "$TAG" "$RUNNER_TEMP/sp-client-manifest-${TAG#payload-}.json" -R lilyco-42/StrongholdProtocolClient
           gh release view "$TAG" -R lilyco-42/StrongholdProtocolClient --json tagName,isDraft,assets \
             --jq '{tagName,isDraft,assets:[.assets[]|{name,size,digest}]}'
+
+      # 把**轻量两件套**同步到 lain42.top 的软件下载站 —— 与 lyco_music 同一套做法：CI 拿 SSH 私钥 scp 上去。
+      # 为什么不连整包（770 MB）一起传：这台机器 40 G 的盘还要养 lyco_music 那几版，而整包本来就有
+      # GitHub Release 与 R2 两条路。同步上去的是**自动更新真正搬的那一份**：代码增量（11 MB 而不是
+      # 770 MB）与客户端读的清单 —— 玩家更新走国内，不必挤 GitHub。
+      #
+      # 🔴 保留策略是这一步最要紧的：lyco_music 那边每次只删当前 stage 再重建、**从不清理旧版**，
+      #    11 个历史版本堆到 6.5 G 把盘吃到 97%（2026-10-17 实测，后来是手删的）。
+      #    所以这边上传完立刻按时间倒序只留最近 3 版 —— 新机制不能继承制造问题的那个形状。
+      # 未配置 LAIN42_SSH_KEY 时直接跳过：GitHub Release 已经出好了，下载站只是多一条路。
+      - name: 同步到 lain42.top（代码增量 + 清单）
+        env:
+          SSH_KEY: ${{ secrets.LAIN42_SSH_KEY }}
+          TAG: ${{ inputs.out_tag }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#payload-}"
+          if [ "$PUBLISH" = 'no' ]; then
+            echo "publish=no —— 不上 lain42.top：包没有出版，同步出去也没有意义。"
+            exit 0
+          fi
+          if [ -z "$SSH_KEY" ]; then
+            echo 'LAIN42_SSH_KEY 未配置，跳过同步到 lain42.top（不影响已经出好的 GitHub Release）。'
+            echo '要启用：gh secret set LAIN42_SSH_KEY -R lilyco-42/StrongholdProtocolClient < ~/.ssh/id_lain42'
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_lain42
+          chmod 600 ~/.ssh/id_lain42
+          ssh-keyscan -H lain42.top >> ~/.ssh/known_hosts 2>/dev/null || true
+          DEST="/var/www/studio/downloads/stronghold/$VER"
+          ssh -i ~/.ssh/id_lain42 root@lain42.top "mkdir -p $DEST"
+          for f in "$RUNNER_TEMP/sp-client-code-$VER.tar.gz" "$RUNNER_TEMP/sp-client-manifest-$VER.json"; do
+            echo "--- 传 $(basename "$f")"
+            scp -i ~/.ssh/id_lain42 "$f" "root@lain42.top:$DEST/"
+          done
+          # 清单里那份摘要是给客户端校验用的，落盘时再算一次：与 GitHub Release 上的摘要对得上才算同步成功。
+          ssh -i ~/.ssh/id_lain42 root@lain42.top "cd $DEST && sha256sum * > SHA256SUMS && cat SHA256SUMS"
+          ssh -i ~/.ssh/id_lain42 root@lain42.top \
+            "cd /var/www/studio/downloads/stronghold && ls -1t | tail -n +4 | xargs -r rm -rf; echo '保留:' \$(ls -1t | tr '\n' ' '); du -sh /var/www/studio/downloads/stronghold"
