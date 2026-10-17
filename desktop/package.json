@@ -34,6 +34,8 @@
       "serve.mjs",
       "trust.mjs",
       "payload-path.mjs",
+      "updater.mjs",
+      "tar.mjs",
       "lan.mjs",
       "package.json",
       "!node_modules/**/*"

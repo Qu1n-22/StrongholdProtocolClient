@@ -355,5 +355,16 @@ jobs:
           done
           # 清单里那份摘要是给客户端校验用的，落盘时再算一次：与 GitHub Release 上的摘要对得上才算同步成功。
           ssh -i ~/.ssh/id_lain42 root@lain42.top "cd $DEST && sha256sum * > SHA256SUMS && cat SHA256SUMS"
+          # 客户端需要一个固定 URL 才知道"最新是哪一份" —— 清单与增量包的名字都带版本号，它猜不出来。
+          # 指针的职责就是变，这与"绝不覆盖玩家手里的永久下载 URL"不冲突：被覆盖的只有这一个几 KB 的指针，
+          # 真正的包仍按版本命名、永久不变（docs/AUTO-UPDATE.md §3）。
+          python3 scripts/make-stable-pointer.py \
+            --manifest "$RUNNER_TEMP/sp-client-manifest-$VER.json" \
+            --out "$RUNNER_TEMP/stable.json" \
+            --base "https://lain42.top/downloads/stronghold/$VER" \
+            --fallback "https://github.com/lilyco-42/StrongholdProtocolClient/releases/download/$TAG"
+          scp -i ~/.ssh/id_lain42 "$RUNNER_TEMP/stable.json" "root@lain42.top:/var/www/studio/downloads/stronghold/stable.json"
+          # 保留策略只对**版本目录**生效：指针 stable.json 就躺在同一个目录下，
+          # 用 `ls -1t | tail -n +4` 会把它当成一个旧版本删掉（它比任何版本目录都旧，正好落在第 4 位之外）。
           ssh -i ~/.ssh/id_lain42 root@lain42.top \
-            "cd /var/www/studio/downloads/stronghold && ls -1t | tail -n +4 | xargs -r rm -rf; echo '保留:' \$(ls -1t | tr '\n' ' '); du -sh /var/www/studio/downloads/stronghold"
+            "cd /var/www/studio/downloads/stronghold && find . -maxdepth 1 -mindepth 1 -type d -printf '%T@\t%p\n' | sort -rn | tail -n +4 | cut -f2 | xargs -r rm -rf; echo '保留的版本:' \$(find . -maxdepth 1 -mindepth 1 -type d -printf '%f\n'); du -sh /var/www/studio/downloads/stronghold"

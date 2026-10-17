@@ -35,7 +35,7 @@ payload 里 99% 的字节是美术：一条 `assets/` 就 13,342 个文件、约
 
 美术指纹是"名字 + 每个文件的 sha256 再聚一次"，不是 mtime —— mtime 在解包/打包里会变，用它做判据会把好包判成不同。
 
-## 3. 壳侧的落地顺序（还没做完，按这个顺序做）
+## 3. 壳侧的落地顺序（1–3 已落地，4–5 待做）
 
 1. ✅ **payload 位置能被换（两个壳都已做，run 38024617803：cargo test + 那条一致性闸门都过）** —— Tauri 侧是
    `locate_www()`，Electron 侧以前是写死的 `process.resourcesPath/www`，现在两边同一顺序：
@@ -52,15 +52,32 @@ payload 里 99% 的字节是美术：一条 `assets/` 就 13,342 个文件、约
    已发布的 `v0.2.2-c32` 里那批壳**不含**这条链（它比这条改动早）—— 不回头覆盖它，改动随下一刀出。
    两边的 userData 不是同一个目录（Electron 按产品名，Tauri 按 identifier），也就是各管各的更新 —— 目前不共享，
    共享要先把落点从各家的数据目录里搬出来，那是另一笔账。
-3. **取清单与下载**：读 `https://github.com/.../releases/…`（公开仓，匿名可读）。超时/失败静默，不挡启动、不弹全屏错误。
-   两件事要先落地：
-   - **壳怎么知道"最新是哪一份"**：清单文件名带版本（`sp-client-manifest-0.2.3-c33.json`），没有固定 URL。
-     要么让壳调 `releases/latest` 再按名字筛资产，要么在一个专门的"频道 Release"里放固定名字的指针文件
-     （`stable.json` / `canary.json`）。指针文件的职责就是变，和"绝不覆盖玩家-facing 的永久下载 URL"不冲突 ——
-     但这条界线要写在这里，不然以后会被误读成双标。
-   - **现在还没有可读的清单**：核对过 `payload-v0.2.2-c32` 的资产列表，里面只有 `sp-client-payload-0.2.2-c32.tar.gz`
-     一项 —— 代码增量与清单是加完"拆两半"那步之后才会出现的，从下一个发布出去的 cut（c33）起才有。
-     之前那次带拆分的验证跑用的是 `publish=no`，什么都没上传。
+3. ✅ **取清单与下载**（2026-10-17，`desktop/updater.mjs` + `desktop/tar.mjs`）。顺序与取舍：
+
+   - **壳怎么知道"最新是哪一份"**：清单与增量都带版本号，没有固定 URL，所以出包时由
+     `scripts/make-stable-pointer.py` 再生成一份**固定名字的指针** `stable.json`（`cut-payload.yml` 最后一步
+     连同增量一起推到 `https://lain42.top/downloads/stronghold/stable.json`）。指针的职责就是变 —— 这与
+     "绝不覆盖玩家手里的永久下载 URL" 不冲突：被覆盖的只有这一个几 KB 的指针，真正的包仍按版本命名、永久不变。
+   - **两个源**：主源是国内的 lain42.top，取不到才退回 GitHub Release（`pointer.fallbackBase`）。
+     大陆连 GitHub 时好时坏（上面记过实测 ECONNRESET），所以主源必须在国内，而**两份指向同一批字节、
+     sha256 相同**这一条由清单保证。
+   - **不认的 `schema` 一律不应用**；`minShell` 高于本壳的协议也不推（那是"请下完整安装包"的意思）。
+   - **先验 sha256 再解包**，解到 `<userData>/payload/.staging-<cut>`，换 `current` 是
+     「旧的那份先挪到 `.old-<ts>`，再把 staging 挪成 `current`，后者失败就挪回来」——
+     换不动必须留在上一份。
+   - **增量里没有 `assets/`**（cut-payload 用 `--exclude=./assets` 打的），所以解出来的 overlay 用
+     **目录链接**（Windows junction / POSIX symlink）把现存的美术目录接到 `<overlay>/assets`，不拷 1 GB。
+   - **美术指纹**（`名字 + 每个文件的 sha256 再聚一次`，与 cut-payload 那句 `sha256sum | sha256sum` 同形）
+     不等就不吃增量。第一次算要读一遍 1 GB，之后缓存在 `<userData>/payload/art-fingerprint.json`
+     （目录 + 文件数对得上就直接用）；`SP_ART_DIGEST` 可以强制指定。
+   - **全程后台、失败静默**：窗口出来之后才查，`runUpdate()` 永不抛错，只返回 `{ status, why }`，
+     写进 `<userData>/client.log`。更新**只对下一次启动生效**（不 reload 正在打的那一局）。
+     开发跑默认不查（overlay 排在仓库构建产物前面，会挡住本地改动），`SP_UPDATE=1` 打开、
+     `--no-update` / `SP_NO_UPDATE=1` 关掉。
+   - `desktop/package.json` 的 `build.files` 逐个列文件并排除了 `node_modules`，**不能加 npm 依赖**，
+     所以解 `.tar.gz` 是自己写的（zlib + USTAR，`desktop/tar.mjs`），系统 `tar` 也不可靠（Windows 上随版本变）。
+   - 每一步都有测试：`test/updater.test.js`（假文件系统 + 假 fetch；指针解析、指纹不符、sha256 不符、
+     tar slip、换 `current` 失败后上一份还在）。
 
 4. **完整性：sha256 就够，这一版不签名**（2026-10-10 按"只有一个人开发"的现实定，task #75）。
    要防的威胁是"包在下路上被换掉/截断"，sha256 + 先验后解已经覆盖；清单签名要防的是"能写仓库的人给所有客户端推代码"，
