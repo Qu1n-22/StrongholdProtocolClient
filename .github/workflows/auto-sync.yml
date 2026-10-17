@@ -381,20 +381,28 @@ jobs:
           echo "✓ 已推 $LIVE @ $LOCAL —— 服务端的 deploy hook/timer 会在几分钟内把这一刀上线"
           echo "  回滚：git fetch origin && git reset --hard $PREV_ONLINE && git push --force-with-lease origin HEAD:refs/heads/$LIVE"
 
-      # 只有上面失败那几类（冲突 / 套件红 / 缺素材）才有这一步：常规版本不用人造访。
+      # 两种"要人"的情况：① 上面那一步自己败了（冲突/套件红/缺素材）；② 连试都没资格试 ——
+      # 量代价那一步就已经报了冲突或补丁打不上。第二种最容易变成"没人看见的红灯"：lane 是绿的，
+      # 报告躺在 artifact 里，而服务端一直停在老版本上。所以这里两条都要叫人。
       - name: 需要人处理时落成 issue
-        if: failure() && steps.auto.outputs.outcome != ''
+        if: |
+          (failure() && steps.auto.outputs.outcome != '')
+          || (env.MODE == 'auto' && steps.up.outputs.up_to_date == 'no'
+              && (steps.try.outputs.conflicts != '0' || steps.try.outputs.patch != 'ok'))
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OUTCOME: ${{ steps.auto.outputs.outcome }}
+          CONFLICTS: ${{ steps.try.outputs.conflicts }}
+          PATCH: ${{ steps.try.outputs.patch }}
           NEWEST: ${{ steps.up.outputs.newest }}
           LIVE: ${{ env.LIVE_REF }}
           PREV: ${{ steps.auto.outputs.PREV_HEAD }}
           REPORT: ${{ runner.temp }}/auto-sync-report.md
         run: |
           set -euo pipefail
+          WHY="${OUTCOME:-量代价那一步就没过（冲突 ${CONFLICTS:-?} / 补丁 ${PATCH:-?}）}"
           TITLE="auto-sync 需要人：上游 ${NEWEST} 没能自动合进 ${LIVE}"
-          BODY="自动 lane 跑到 \`${OUTCOME}\` 就停了，**没有推任何东西**，服务端仍在线上原来那一刀。
+          BODY="自动 lane 停在：\`${WHY}\`。**没有推任何东西**，服务端仍在线上原来那一刀。
 
           - 上游那一刀：\`${NEWEST}\`
           - 目标分支：\`${LIVE}\`（回滚基线 \`${PREV:-（未知）}\`）
