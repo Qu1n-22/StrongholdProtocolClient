@@ -10,7 +10,7 @@
 // the game keeps its identity token, loadout and settings in — must be the same on every launch. Binding an
 // ephemeral port instead made every restart look like a fresh install (see serve.mjs).
 //
-//   StrongholdProtocol.exe [--server <address>] [--fullscreen] [--choose-server] [--insecure-tls]
+//   StrongholdProtocol.exe [--server <address>] [--fullscreen] [--choose-server] [--insecure-tls] [--board 2d|3d]
 //
 // `--server` overrides the built-in address for this run (LAN play without a rebuild) by appending ?server=…
 // which public/js/net.js understands. Otherwise the client uses the server remembered by the in-page picker
@@ -25,7 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, appendFileSync, statSync, writeFileSync } from 'node:fs';
 import { app, BrowserWindow, Menu, dialog, shell } from 'electron';
 import { createStaticServer, DEFAULT_PORT } from './serve.mjs';
-import { resolveWww, wwwCandidates } from './payload-path.mjs';
+import { resolveWww, wwwCandidates, OVERLAY_DIR } from './payload-path.mjs';
+import { runUpdate } from './updater.mjs';
 import { createLanManager, lanCandidates } from './lan.mjs';
 import { describeCertificate, fingerprintOf, hostKey, isTrusted, loadTrusted, remember, saveTrusted, shortFingerprint } from './trust.mjs';
 
@@ -71,6 +72,28 @@ function log(...args) {
 log(`payload 来源：${WWW_PICK.source || '(没有一个候选可用，退回默认)'} → ${WWW}`);
 for (const r of WWW_PICK.rejected) log(`  跳过 ${r.source}（${r.dir}）：${r.why}`);
 
+/**
+ * 自动更新的检查（docs/AUTO-UPDATE.md §3 第 3 步）。三个刻意的取舍：
+ *  - **后台、不挡启动**：窗口已经出来了才查，失败也只是日志里一行，绝不弹框 —— 大陆连 GitHub 时好时坏，
+ *    "取不到"是常态而不是故障。
+ *  - **只为下一次启动准备**：更新写成 `<userData>/payload/current` 后不 reload 当前窗口，
+ *    否则一局打到一半会被换掉脚下的那份代码。
+ *  - **开发跑不查**：overlay 排在仓库构建产物前面（payload-path.mjs 的次序），真应用一份会把本地改动挡住；
+ *    `SP_UPDATE=1` 可以强制打开，`--no-update` / `SP_NO_UPDATE=1` 可以关掉。
+ */
+function startUpdateCheck() {
+  if (!app.isPackaged && !process.env.SP_UPDATE) return;
+  if (process.env.SP_NO_UPDATE || process.argv.includes('--no-update')) { log('[update] 已关闭（--no-update / SP_NO_UPDATE）'); return; }
+  runUpdate({
+    payloadDir: path.join(app.getPath('userData'), OVERLAY_DIR),
+    artDir: path.join(WWW, 'assets'),
+    log,
+    env: process.env,
+  }).then((r) => {
+    log(`[update] 结果：${r.status}${r.cut ? ` (${r.cut})` : ''}${r.why ? ` —— ${r.why}` : ''}${r.status === 'applied' ? ' —— 下次启动生效' : ''}`);
+  }, (e) => log('[update] 未捕获', e));
+}
+
 /** `--server host:port` / `--server=host:port` (see the header). */
 function argValue(name) {
   const argv = process.argv.slice(app.isPackaged ? 1 : 2);
@@ -84,6 +107,13 @@ function argValue(name) {
 
 const serverOverride = argValue('--server').trim();
 const chooseServer = !serverOverride && process.argv.includes('--choose-server');
+/**
+ * `--board 2d|3d`：强制棋盘层。默认 `auto` 是"本地美术装了 + 有 WebGL2 就上官方 3D 场景"，而**网页版通常没有
+ * 本地美术，跑的是 2D 图集棋盘** —— 这是"客户端看得见、网页版看不见"的那类差别最常见的源头，所以这个开关是
+ * 排查（也是绕行）的第一步：`StrongholdProtocol.exe --board 2d` 起一次，重合还在就说明与 3D 无关。
+ */
+const boardMode = argValue('--board').trim().toLowerCase();
+const forcedBoard = boardMode === '2d' || boardMode === '3d' ? boardMode : '';
 const startFullscreen = process.argv.includes('--fullscreen');
 /**
  * `--insecure-tls`: accept every certificate without asking, instead of prompting once per server (see the
@@ -223,9 +253,12 @@ async function main() {
   // Chromium scopes localStorage by origin, so this is what lets the identity token, the loadout, settings and
   // the picker's saved server survive a restart; an OS-assigned port would silently discard all of it.
   const served = await createStaticServer({ root: WWW, port: DEFAULT_PORT, log: console, lan });
-  const query = serverOverride
-    ? `?server=${encodeURIComponent(serverOverride)}`
-    : (chooseServer ? '?pick=1' : '');
+  const queryParts = [];
+  if (serverOverride) queryParts.push(`server=${encodeURIComponent(serverOverride)}`);
+  if (chooseServer) queryParts.push('pick=1');
+  if (forcedBoard) queryParts.push(`board=${forcedBoard}`);
+  const query = queryParts.length ? `?${queryParts.join('&')}` : '';
+  if (forcedBoard) log(`[client] --board ${forcedBoard}: 棋盘层被强制成 ${forcedBoard === '2d' ? '2D 图集' : '3D 场景'}（排查用）`);
 
   win = new BrowserWindow({
     width: 1440,
@@ -269,6 +302,7 @@ async function main() {
     log(`[client] loadURL failed: ${e?.message || e}`);
   }
   log(`[client] serving ${WWW} at ${served.url}, game server ${serverOverride || '(picker / runtime-config.js)'}`);
+  startUpdateCheck();
 
   app.on('second-instance', () => {
     // A second launch while this one runs: bring the existing window forward (the new process quits by design).
