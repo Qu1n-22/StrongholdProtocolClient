@@ -191,6 +191,7 @@ jobs:
       # `--allow-shrink` 不是解法：它把 941 个音效池砍到 933，音频测试立刻红。
       # 所以单独一步，只补 `清单点名 + 盘上没有 + /assets/audio/sfx/**` 的那几只，源是官方镜像的 voice 分支。
       - name: 补音效缺口(plan 不生成、镜像上有)
+        working-directory: game
         run: |
           set -euo pipefail
           node tools/fetch-audio-gaps.mjs
