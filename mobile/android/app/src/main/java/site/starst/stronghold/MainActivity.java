@@ -47,6 +47,15 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         applyImmersive();
+        // Android 15+ forces edge to edge, and Capacitor's bridge also applies the window insets to the WebView itself.
+        // Either path can leave the WebView sized one inset short of the display — which shows up as a strip of window
+        // background down one EDGE of the game (a player on Android 14 / Honor CLK-AN00 reported exactly that: the game
+        // drawn at 765×360 inside a wider screen, a light band on the left). The page draws into the cutout on purpose
+        // (viewport-fit=cover; public/css/devices.css keeps the HUD inside env(safe-area-inset-*)), so no View-level
+        // padding is wanted here: consume the insets and let the CSS own them.
+        if (bridge != null && bridge.getWebView() != null) {
+            ViewCompat.setOnApplyWindowInsetsListener(bridge.getWebView(), (v, insets) -> WindowInsetsCompat.CONSUMED);
+        }
         jsonExportBridge = new JsonExportBridge(this);
         if (bridge != null) bridge.getWebView().addJavascriptInterface(jsonExportBridge, "StrongholdSaveBridge");
         installCertificatePrompt();
