@@ -50,6 +50,14 @@ on:
         description: 'tar 的资产文件名'
         required: false
         default: 'sp-client-payload-0.2.2-c30.tar.gz'
+      pointer:
+        description: 'yes=同时把 stable.json 指到这一刀（=让所有已装客户端自动吃它）/ no=只传包，指针不动'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
       publish:
         description: 'no=只过闸门并打印 / draft=建 Draft Release / ready=建 Release 并直接可下载'
         required: false
@@ -331,6 +339,7 @@ jobs:
           SSH_KEY: ${{ secrets.LAIN42_SSH_KEY }}
           TAG: ${{ inputs.out_tag }}
           PUBLISH: ${{ inputs.publish }}
+          POINTER: ${{ inputs.pointer }}
         run: |
           set -euo pipefail
           VER="${TAG#payload-}"
@@ -355,6 +364,14 @@ jobs:
           done
           # 清单里那份摘要是给客户端校验用的，落盘时再算一次：与 GitHub Release 上的摘要对得上才算同步成功。
           ssh -i ~/.ssh/id_lain42 root@lain42.top "cd $DEST && sha256sum * > SHA256SUMS && cat SHA256SUMS"
+          # 🔴 指针是**发布开关**，不是切包的副产品：它一改，所有装了客户端的玩家下次启动就会自动吃这一刀
+          # （2026-10-18 那次就是这样翻车的 —— c48 的代码配的还是 c46 的素材，切完包里指针就被推了上去，
+          # 玩家一开游戏 0.3.0 变 0.3.1、干员立绘一片空）。所以这里默认不碰指针，必须显式 pointer=yes。
+          # 只有在"这一刀被真机验过"之后才该动它：先 publish=draft → 自己装一次 → 再 --pointer yes 重跑同步。
+          if [ "$POINTER" != 'yes' ]; then
+            echo "pointer=$POINTER —— 只传了包与清单，stable.json 没动。要让客户端自动吃这一刀，重跑时带 -f pointer=yes。"
+            exit 0
+          fi
           # 客户端需要一个固定 URL 才知道"最新是哪一份" —— 清单与增量包的名字都带版本号，它猜不出来。
           # 指针的职责就是变，这与"绝不覆盖玩家手里的永久下载 URL"不冲突：被覆盖的只有这一个几 KB 的指针，
           # 真正的包仍按版本命名、永久不变（docs/AUTO-UPDATE.md §3）。

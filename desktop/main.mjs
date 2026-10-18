@@ -22,7 +22,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, appendFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, appendFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { app, BrowserWindow, Menu, dialog, shell } from 'electron';
 import { createStaticServer, DEFAULT_PORT } from './serve.mjs';
 import { resolveWww, wwwCandidates, OVERLAY_DIR } from './payload-path.mjs';
@@ -81,8 +81,7 @@ for (const r of WWW_PICK.rejected) log(`  跳过 ${r.source}（${r.dir}）：${r
  *  - **开发跑不查**：overlay 排在仓库构建产物前面（payload-path.mjs 的次序），真应用一份会把本地改动挡住；
  *    `SP_UPDATE=1` 可以强制打开，`--no-update` / `SP_NO_UPDATE=1` 可以关掉。
  */
-function startUpdateCheck() {
-  if (!app.isPackaged && !process.env.SP_UPDATE) return;
+function startUpdateCheck() {  if (!app.isPackaged && !process.env.SP_UPDATE) return;
   if (process.env.SP_NO_UPDATE || process.argv.includes('--no-update')) { log('[update] 已关闭（--no-update / SP_NO_UPDATE）'); return; }
   runUpdate({
     payloadDir: path.join(app.getPath('userData'), OVERLAY_DIR),
@@ -120,6 +119,29 @@ const startFullscreen = process.argv.includes('--fullscreen');
  * certificate-error handler below). For a player who runs a self-signed server and does not want to be asked.
  */
 const insecureTls = process.argv.includes('--insecure-tls');
+
+/**
+ * `--reset-payload`：删掉 `<userData>/payload` 再退出。这不是开发工具，是**玩家手里的自救开关** ——
+ * 一次自动更新换上了坏的那份 overlay（2026-10-18 那次就是这样：代码到了 0.3.1，素材还是 0.3.0，
+ * 干员调配里一片空图），不重装客户端的唯一解法就是把它扔掉，退回安装包内置那份。
+ */
+if (process.argv.includes('--reset-payload')) {
+  const overlayRoot = path.join(app.getPath('userData'), OVERLAY_DIR);
+  let detail = `已删除 ${overlayRoot}`;
+  try {
+    rmSync(overlayRoot, { recursive: true, force: true });
+    log(`[client] --reset-payload：已删除 ${overlayRoot}，下次启动用安装包内置那份`);
+  } catch (e) {
+    detail = `删除失败：${e?.message || e}`;
+    log('[client] --reset-payload 失败', e);
+  }
+  app.whenReady().then(() => {
+    dialog.showMessageBoxSync({ type: 'info', title: TITLE, message: '已清除自动更新的内容', detail: `${detail}
+
+下次启动会使用安装包内置的那份游戏。` });
+    app.quit();
+  });
+}
 
 // Crash / failure diagnostics. Nothing here quits the app: a renderer that dies is reloaded by the handler below,
 // and an unhandled error must not turn into a silent exit (which is what "打开干员调配就闪退" looks like).
