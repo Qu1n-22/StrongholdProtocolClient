@@ -160,7 +160,18 @@ jobs:
           # provenance 闸门必红（c29 那次实测就是 ` M package-lock.json`）。
           npm ci --ignore-scripts --no-audit --no-fund
           rc=0
-          node tools/fetch-assets.mjs 2>&1 | tail -25 || rc=$?
+          # 最多跑 3 遍：单文件下载会被 raw.githubusercontent 瞬时限流（2026-10-18 实测有 4 个 36 KB 的音效
+          # 连续两次都 miss，本地 curl 却是 200），而 fetch-assets 记成 miss 就继续走 —— 于是最后被存在性闸门判红。
+          # 重试比"刷索引"对路：这里缺的是个别文件的传输，不是索引过期。
+          rc=1
+          for attempt in 1 2 3; do
+            echo "--- fetch-assets 第 $attempt 次 ---"
+            rc=0
+            node tools/fetch-assets.mjs 2>&1 | tail -25 || rc=$?
+            echo "[fetch-assets] 第 $attempt 次退出码 $rc"
+            [ "$rc" = 0 ] && break
+            sleep 10
+          done
           if [ "$rc" != "0" ]; then
             echo "[fetch-assets] 退出码 $rc。继续，但缺的文件由下面的存在性闸门判红 —— 不是「靠已拷进来的那批」就算过。"
           fi
