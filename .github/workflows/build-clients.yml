@@ -210,11 +210,16 @@ jobs:
         run: |
           7z a -mx=9 StrongholdProtocol-desktop.zip build/desktop/win-unpacked
           Copy-Item build/desktop/*-portable.exe,build/desktop/*-Setup.exe,build/desktop/*.msi .
+          # WiX 会把 artifactName 里的连字符换成空格（`StrongholdProtocol-0.3.0.msi` → `StrongholdProtocol 0.3.0.msi`），
+          # 而上传用的是 `StrongholdProtocol-*.msi`：不归一化就会"上传时一个都没匹配到"（upload-artifact 默认只 warn，
+          # 于是流水线是绿的、发布那一头少一件 —— 2026-10-18 实测就是这么丢掉 msi 的）。统一成连字符。
+          Get-ChildItem *.msi | Rename-Item -NewName { $_.Name -replace ' ','-' }
           Get-ChildItem StrongholdProtocol-desktop.zip,*-portable.exe,*-Setup.exe,*.msi |
             Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       - uses: actions/upload-artifact@v4
         with:
+          if-no-files-found: error
           name: stronghold-desktop-win
           path: |
             StrongholdProtocol-desktop.zip
