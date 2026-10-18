@@ -305,10 +305,13 @@ export async function probe(address, timeoutMs = PROBE_TIMEOUT_MS, attempts = 2)
 }
 
 const CSS = `
-.sp-pick{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;
+/* align-items 必须一直是 flex-start：这是个 overflow:auto 的滚动容器，而 flex 容器**同时**做垂直居中时，
+   溢出到起始边（上方）的那部分永远滚不到 —— 服务器列表一长，最上面的几条就永久看不见（玩家只能"删掉底下的
+   才看得到上面的"）。居中改由盒子的 margin:auto 负责：有空间时照样居中，没空间时能滚到顶。 */
+.sp-pick{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:flex-start;justify-content:center;
   background:#0c0f0e;color:#c3cbc7;font-family:"Noto Sans SC","Oxanium",system-ui,sans-serif;padding:16px;
   overflow:auto;-webkit-user-select:none;user-select:none}
-.sp-pick__box{width:min(680px,100%);display:flex;flex-direction:column;gap:14px}
+.sp-pick__box{width:min(680px,100%);display:flex;flex-direction:column;gap:14px;margin:auto 0}
 .sp-pick__title{font-size:20px;letter-spacing:.14em;color:#e8f1ee;font-weight:700}
 .sp-pick__sub{font-size:12px;color:#7d8a86;margin-top:4px;letter-spacing:.1em}
 .sp-pick__head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
