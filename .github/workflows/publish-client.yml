@@ -41,7 +41,8 @@ on:
         required: false
         default: |
           内核：游戏 0.2.2。
-          六个形态在同一个 Release：Windows 便携版与安装版、Android apk、iPhone 未签名 ipa、Tauri 安装器、桌面 zip。
+          九个形态在同一个 Release：Windows 便携版 / 安装版 / msi / 桌面 zip、Tauri 安装器、
+          Android apk、iPhone 未签名 ipa、macOS dmg（x64 与 arm64 各一份）。
       as_draft:
         description: 'yes=建 Draft（玩家看不到）/ no=直接发布'
         required: false
@@ -89,6 +90,7 @@ jobs:
           for pair in "${{ inputs.clients_run }}:stronghold-desktop-win" \
                       "${{ inputs.clients_run }}:stronghold-android-apk" \
                       "${{ inputs.clients_run }}:stronghold-ios-ipa" \
+                      "${{ inputs.clients_run }}:stronghold-macos-dmg" \
                       "${{ inputs.tauri_run }}:stronghold-tauri-win"; do
             run="${pair%%:*}"; name="${pair##*:}"
             # 每个 artifact 单独下：`gh run download` 不带 -n 会把几个 artifact 摊平到同一层，
@@ -127,7 +129,7 @@ jobs:
           n=$(find out -type f | wc -l)
           echo "拿到 $n 个文件"
           find out -type f -printf '%p\t%s B\n' | sort
-          test "$n" -ge 6 || { echo "预期至少 6 个文件，实得 $n —— 缺的就是玩家装不上的那一半"; exit 1; }
+          test "$n" -ge 9 || { echo "预期至少 9 个文件（八种形态，dmg 两份），实得 $n —— 缺的就是某一类玩家装不上的那一半"; exit 1; }
           # 大文件不许"安静地是空的"：小于 1 MB 的一定不是产物本体。
           small=$(find out -type f -size -1M -printf '%p %s\n' | head)
           if [ -n "$small" ]; then echo "这些文件小得不像产物：$small"; exit 1; fi
@@ -135,7 +137,8 @@ jobs:
           missing=""
           for pat in "Stronghold-${NAMEVER}-android-release\\.apk$" "Stronghold-${NAMEVER}-ios-unsigned\\.ipa$" \
                      "StrongholdProtocolTauri-${NAMEVER}-setup\\.exe$" "StrongholdProtocol-desktop-win-${NAMEVER}\\.zip$" \
-                     'StrongholdProtocol-.*-portable\.exe$' 'StrongholdProtocol-.*-Setup\.exe$'; do
+                     'StrongholdProtocol-.*-portable\.exe$' 'StrongholdProtocol-.*-Setup\.exe$' \
+                     'StrongholdProtocol-.*\.msi$' 'StrongholdProtocol-.*-mac-.*\.dmg$'; do
             find out -type f | grep -qE "$pat" || missing="$missing $pat"
           done
           if [ -n "$missing" ]; then echo "缺这些形态：$missing"; find out -type f | sort; exit 1; fi
@@ -198,7 +201,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/$REL_ID/assets" \
             --jq '.[] | "\(.name)\t\(.browser_download_url)"' > /tmp/urls.tsv
           total=$(wc -l < /tmp/urls.tsv)
-          test "$total" -ge 6 || { echo "Release 里只有 $total 条资产，少于六个形态"; exit 1; }
+          test "$total" -ge 9 || { echo "Release 里只有 $total 条资产，少于九个形态"; exit 1; }
           if [ "${{ inputs.as_draft }}" = 'yes' ]; then
             # GitHub Draft 的 browser_download_url 即使带 Bearer token 也可能返回 404。
             # 不以 Draft 下载 URL 判定资产缺失；上一步已比对真实 SHA-256。

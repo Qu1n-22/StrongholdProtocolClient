@@ -191,12 +191,26 @@ jobs:
         shell: bash
         run: node tools/check-payload-offline.mjs build/desktop/win-unpacked/resources/www
 
+      # MSI 单独一步：electron-builder 26.x 没有 MsiTarget（test/packaging.test.js 里钉着这条），
+      # 所以 exe/zip 仍由 26.x 出，msi 交给 27 的 alpha 单独跑一次 —— 混版本不好看，但比为了一个
+      # 安装包格式把整条构建链升上 alpha 要安全得多：27 挂了只影响 msi 这一个产物，其余形态照旧。
+      - name: 打 MSI（electron-builder 27 alpha，单独一步）
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd desktop
+          npx --yes electron-builder@27.0.0-alpha.10 --win msi --publish never 2>&1 | tail -30
+          cd ..
+          compgen -G "build/desktop/*.msi" > /dev/null || {
+            echo "electron-builder 27-alpha 没产出 msi"; ls -l build/desktop; exit 1; }
+          ls -lh build/desktop/*.msi
+
       - name: 打包分发（7z，比 deflate 小）+ 收齐 Windows 三种形态
         shell: pwsh
         run: |
           7z a -mx=9 StrongholdProtocol-desktop.zip build/desktop/win-unpacked
-          Copy-Item build/desktop/*-portable.exe,build/desktop/*-Setup.exe .
-          Get-ChildItem StrongholdProtocol-desktop.zip,*-portable.exe,*-Setup.exe |
+          Copy-Item build/desktop/*-portable.exe,build/desktop/*-Setup.exe,build/desktop/*.msi .
+          Get-ChildItem StrongholdProtocol-desktop.zip,*-portable.exe,*-Setup.exe,*.msi |
             Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
 
       - uses: actions/upload-artifact@v4
@@ -206,6 +220,96 @@ jobs:
             StrongholdProtocol-desktop.zip
             StrongholdProtocol-*-portable.exe
             StrongholdProtocol-*-Setup.exe
+            StrongholdProtocol-*.msi
+          retention-days: 7
+
+  # ---------- macOS（dmg） ----------
+  # 与 Windows 桌面版是同一个 Electron 壳 + 同一份 payload，只是平台换掉：main.mjs / serve.mjs / trust.mjs
+  # 里没有一处 Windows 专属代码，userData 由 `app.getPath('userData')` 拿到（macOS 是
+  # ~/Library/Application Support/<productName>），所以自动更新的目录约定天然跟着平台走。
+  #
+  # 两件必须写在明处的事：
+  #   1) **没有 Apple Developer 证书**，identity=null（desktop/package.json 里写死）→ dmg 未签名、未公证，
+  #      玩家首次打开要「右键 → 打开」绕过 Gatekeeper。这和 ipa 未签名是同一类限制，不是配置漏了。
+  #   2) **没有联机组件**：EasyTier 上游没有给 macOS 的二进制，所以 extraResources 的 ../build/lan 是空目录，
+  #      客户端会报 `disabled`，选服页不显示联机卡片 —— 其余功能一切照旧。
+  macos-dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 下载并解压 payload
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.payload_url }}"
+          [ -n "$URL" ] || URL="https://dl.lain42.top/downloads/stronghold-protocol/client/sp-client-payload.tar.gz"
+          echo "payload: $URL"
+          mkdir -p build/client/www
+          curl -fL --retry 3 --retry-delay 3 "$URL" -o payload.tar.gz
+          ls -lh payload.tar.gz
+          tar -xzf payload.tar.gz -C build/client/www
+          echo "解压文件数: $(find build/client/www -type f | wc -l)"
+
+      - name: 校验 payload 完整性
+        run: |
+          set -euo pipefail
+          for f in index.html js/runtime-config.js js/shell/picker.js js/net.js dev/spine-probe.html dev/spine-probe.js; do
+            test -f "build/client/www/$f" || { echo "缺 $f"; exit 1; }
+          done
+          ASSETS=$(find build/client/www/assets -type f 2>/dev/null | wc -l)
+          echo "素材文件数: $ASSETS"
+          test "$ASSETS" -gt 3000 || { echo "素材不完整（只有 $ASSETS 个）"; exit 1; }
+
+      - name: 校验 payload 版本（闸门）
+        run: |
+          set -euo pipefail
+          EXPECT="${{ github.event.inputs.expect_app }}"
+          WANT_SERVER="${{ github.event.inputs.server }}"
+          REPO=$(node -e 'console.log(require("./package.json").version)')
+          APP=$(node -e 'console.log(require("./build/client/www/build.json").game.app)')
+          GOT_SERVER=$(node -e 'console.log(require("./build/client/www/build.json").server)')
+          echo "payload: game.app=$APP server=$GOT_SERVER ；本仓库 version=$REPO"
+          if [ -n "$EXPECT" ]; then
+            [ "$APP" = "$EXPECT" ] || { echo "闸门：要求 expect_app=${EXPECT}，payload 实为 $APP"; exit 1; }
+          else
+            [ "$APP" = "$REPO" ] || { echo "闸门：payload 是 ${APP}，本仓库已对齐 $REPO —— 换 payload，或传 expect_app=$APP 明确接受"; exit 1; }
+          fi
+          if [ -n "$WANT_SERVER" ]; then
+            [ "$GOT_SERVER" = "$WANT_SERVER" ] || { echo "闸门：要求 server=${WANT_SERVER}，payload 实为 $GOT_SERVER"; exit 1; }
+          fi
+
+      - name: payload 出处（闸门）
+        run: node tools/check-payload-provenance.mjs build/client/www
+
+      - name: 装 desktop 依赖
+        run: cd desktop && npm install
+
+      # extraResources 里列了 ../build/lan：目录不存在 electron-builder 会直接中断整条构建。
+      # macOS 没有 EasyTier 二进制，这里就是那个占位空目录。
+      - name: 联机组件占位（macOS 没有 sidecar）
+        run: |
+          mkdir -p build/lan
+          echo "::notice::macOS 版不含联机组件（EasyTier 无 darwin 二进制），客户端会报 disabled"
+
+      - name: 打 dmg（x64 + arm64 各一份）
+        run: cd desktop && npx electron-builder --mac dmg --x64 --arm64 --publish never
+
+      - name: 校验产物
+        run: |
+          set -euo pipefail
+          ls -lh build/desktop/*.dmg
+          # 两个架构各一份：少一个说明 --x64 --arm64 里有一个没打成，发出去就会有人说"我的 Mac 装不上"
+          test "$(ls build/desktop/*.dmg | wc -l | tr -d ' ')" -ge 2 || {
+            echo "dmg 少于两个（x64 / arm64 应各一份）"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stronghold-macos-dmg
+          path: build/desktop/*.dmg
           retention-days: 7
 
   # ---------- Android APK ----------

@@ -70,6 +70,15 @@
       "allowElevation": false,
       "deleteAppDataOnUninstall": false,
       "shortcutName": "卫戍协议：盟约"
+    },
+    "mac": {
+      "category": "public.app-category.games",
+      "target": [
+        "dmg"
+      ],
+      "icon": "icon.png",
+      "identity": null,
+      "artifactName": "StrongholdProtocol-${version}-mac-${arch}.dmg"
     }
   }
 }
