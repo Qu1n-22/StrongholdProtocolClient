@@ -21,7 +21,6 @@
     "appId": "site.starst.stronghold",
     "productName": "StrongholdProtocol",
     "asar": true,
-    "npmRebuild": false,
     "electronLanguages": [
       "zh-CN",
       "en-US"
@@ -77,7 +76,6 @@
         "dmg"
       ],
       "icon": "icon.png",
-      "identity": null,
       "artifactName": "StrongholdProtocol-${version}-mac-${arch}.dmg"
     }
   }
