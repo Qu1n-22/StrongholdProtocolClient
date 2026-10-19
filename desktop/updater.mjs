@@ -24,7 +24,7 @@ import {
 } from 'node:fs';
 
 import { safeJoin, untarGzip } from './tar.mjs';
-import { CURRENT_LINK, OVERLAY_DIR } from './payload-path.mjs';
+import { CURRENT_LINK, OVERLAY_DIR, compareVersions } from './payload-path.mjs';
 
 /** 指针格式版本。不认的 schema 一律不应用（宁可不更）。 */
 export const POINTER_SCHEMA_SUPPORTED = 1;
@@ -84,11 +84,17 @@ export function parsePointer(json) {
 
 /**
  * 要不要吃这一份增量。**每一条 skip 都带 why**，因为"我更新了没生效"唯一的排查入口就是 client.log。
+ * `localVersion`（手里这份 payload 的 game 版本，payload-path.mjs 同一个读法）是 2026-10-19 之后的一道保险：
+ * 指针指向的版本比手里这份**旧**（比如指针回滚、或玩家已装了更新的完整包）时，增量再"配套"也不该吃 ——
+ * c48 事故（0.3.1 代码被 0.3.0 指针盖回去）的复盘结论。
  */
-export function decide({ pointer, shellProtocol = SHELL_PROTOCOL, localArt = '', appliedCut = '' }) {
+export function decide({ pointer, shellProtocol = SHELL_PROTOCOL, localArt = '', appliedCut = '', localVersion = '' }) {
   if (!pointer) return { action: 'skip', why: '没有可用的指针' };
   if (pointer.minShell > shellProtocol) {
     return { action: 'skip', why: `这一刀要求壳协议 ${pointer.minShell}，本壳是 ${shellProtocol} —— 请下载完整安装包` };
+  }
+  if (localVersion && pointer.version && compareVersions(localVersion, pointer.version) > 0) {
+    return { action: 'skip', why: `指针的 ${pointer.version} 比手里这份 ${localVersion} 旧 —— 不吃旧版本` };
   }
   if (appliedCut && appliedCut === pointer.cut) return { action: 'skip', why: `已经是这一刀（${pointer.cut}）` };
   if (!localArt) return { action: 'skip', why: '算不出本地美术指纹 —— 不能确认这份增量适用于手里的美术' };
@@ -275,6 +281,7 @@ export const fsIo = {
 export async function runUpdate({
   payloadDir,
   artDir,
+  localVersion = '',
   log = () => {},
   io = fsIo,
   fetchImpl = globalThis.fetch,
@@ -312,7 +319,7 @@ export async function runUpdate({
   const local = localArtDigest({ artDir: artRoot, cacheFile, io, env });
   const appliedCut = readAppliedCut({ overlayDir: path.join(payloadDir, CURRENT_LINK), io });
   log(`[update] 本地美术指纹 ${local.digest ? `${local.digest.slice(0, 12)}…（${local.from}）` : '（算不出）'}；已应用 ${appliedCut || '（无）'}`);
-  const verdict = decide({ pointer, shellProtocol, localArt: local.digest, appliedCut });
+  const verdict = decide({ pointer, shellProtocol, localArt: local.digest, appliedCut, localVersion });
   if (verdict.action !== 'apply') {
     log(`[update] 不应用 ${pointer.cut}：${verdict.why}`);
     return done('skipped', { why: verdict.why, cut: pointer.cut });

@@ -72,3 +72,65 @@ test('payloadProblem names the missing file instead of a bare false', () => {
   assert.match(payloadProblem('X', { isFile: (p) => p.endsWith('index.html') }), /build\.json/, '只有 index.html 时缺的是 build.json');
   assert.equal(payloadProblem('X', { isFile: (p) => p.endsWith('index.html') || p.endsWith('build.json') }), '', '两个文件都在才算合格');
 });
+
+// ── 2026-10-19「素材没匹配上」：重装完整包后，旧更新残留不能盖住新装的那份 ────────────────────────────
+// 玩家装了 0.3.1-c50 完整包，跑的却是 `<userData>/payload/current` 里上一份安装留下的 0.3.0 代码增量 ——
+// 新美术配旧代码，素材对不上。版本规则：overlay 比安装包内置的旧 → 跳过，理由写进 client.log。
+
+const versionOfIn = (map) => (dir) => map.get(path.normalize(dir)) || '';
+const FULL_OVERLAY = {
+  [path.normalize(overlay('current/index.html'))]: 1,
+  [path.normalize(overlay('current/build.json'))]: 1,
+};
+const FULL_BUNDLED = {
+  [path.normalize(bundled('index.html'))]: 1,
+  [path.normalize(bundled('build.json'))]: 1,
+};
+const versions = new Map([
+  [path.normalize(overlay('current')), '0.3.0'],
+  [path.normalize(path.join(RES, 'www')), '0.3.1'],
+]);
+
+test('an overlay older than the bundled copy loses to it (reinstalled a fuller installer)', () => {
+  const r = resolveWww({
+    candidates: cands(),
+    isFile: isFileIn(FILES(...Object.keys(FULL_OVERLAY), ...Object.keys(FULL_BUNDLED))),
+    versionOf: versionOfIn(versions),
+  });
+  assert.equal(r.source, '安装包内置', '重装 0.3.1 之后不能再跑 overlay 里的 0.3.0');
+  assert.equal(r.rejected.length, 1);
+  assert.match(r.rejected[0].why, /0\.3\.0.*0\.3\.1/, 'client.log 里要能看出是版本规则跳的');
+});
+
+test('an overlay as new as the bundled copy still wins (the auto-update path is untouched)', () => {
+  const same = new Map(versions).set(path.normalize(overlay('current')), '0.3.1');
+  const r = resolveWww({
+    candidates: cands(),
+    isFile: isFileIn(FILES(...Object.keys(FULL_OVERLAY), ...Object.keys(FULL_BUNDLED))),
+    versionOf: versionOfIn(same),
+  });
+  assert.equal(r.source, '已应用的更新');
+});
+
+test('an overlay whose art link dangled is skipped even at the same version (缺 assets/) ', () => {
+  const same = new Map(versions).set(path.normalize(overlay('current')), '0.3.1');
+  const isDirIn = (set) => (p) => set.has(path.normalize(p));
+  const r = resolveWww({
+    candidates: cands(),
+    isFile: isFileIn(FILES(...Object.keys(FULL_OVERLAY), ...Object.keys(FULL_BUNDLED), path.normalize(overlay('current/data/assets.json')))),
+    isDir: isDirIn(FILES()),
+    versionOf: versionOfIn(same),
+  });
+  assert.equal(r.source, '安装包内置', '没有美术的 overlay 服务出来的就是一个没素材的游戏');
+  assert.match(r.rejected[0].why, /assets/);
+});
+
+test('an unreadable version opts the candidate out of the version rule (dev checkouts stay honest)', () => {
+  const none = new Map();
+  const r = resolveWww({
+    candidates: cands(),
+    isFile: isFileIn(FILES(...Object.keys(FULL_OVERLAY), ...Object.keys(FULL_BUNDLED))),
+    versionOf: versionOfIn(none),
+  });
+  assert.equal(r.source, '已应用的更新', '读不出版本就按老规矩来');
+});

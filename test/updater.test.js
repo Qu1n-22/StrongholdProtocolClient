@@ -336,6 +336,7 @@ describe('判定：不更也要说清为什么', () => {
     ['已经是这一刀', { localArt: sha('art'), appliedCut: P.cut }, /已经是这一刀/],
     ['壳太旧', { localArt: sha('art'), pointer: parsePointer(pointer({ artDigest: sha('art'), minShell: SHELL_PROTOCOL + 1 })).pointer }, /完整安装包/],
     ['没有指针', { localArt: sha('art'), pointer: null }, /没有可用的指针/],
+    ['指针比手里的旧（2026-10-19 后的保险）', { localArt: sha('art'), localVersion: '0.3.1' }, /比手里这份 0\.3\.1 旧/],
   ]) {
     test(`${name} → skip，并且 why 进日志`, () => {
       const r = decide({ pointer: P, ...o });
@@ -548,4 +549,12 @@ describe('runUpdate 端到端', () => {
     assert.equal(f.io.links.get(`${PAYLOAD}/current/assets`), ART, '链接目标必须是解析后的真实目录');
     assert.equal(f.io.files.get(`${PAYLOAD}/current/index.html`).toString(), '<html>v2</html>');
   });
+});
+
+// ── 2026-10-19：指针版本比手里这份旧时不吃（c48 事故的复盘保险，decide 的 localVersion 参数） ──
+test('指针同版本时 localVersion 不拦路（0.3.0 对 0.3.0 照常走后续判定）', () => {
+  const P = parsePointer(pointer({ artDigest: sha('art'), codeSha: sha('code') })).pointer;
+  const r = decide({ pointer: P, localArt: sha('art'), localVersion: '0.3.0' });
+  assert.ok(!/旧/.test(r.why), `同版本不该被版本规则拦：${r.why}`);
+  assert.equal(r.action, 'apply');
 });

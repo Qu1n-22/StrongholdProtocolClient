@@ -22,7 +22,7 @@
 
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, appendFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, appendFileSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { app, BrowserWindow, Menu, dialog, shell } from 'electron';
 import { createStaticServer, DEFAULT_PORT } from './serve.mjs';
 import { resolveWww, wwwCandidates, OVERLAY_DIR } from './payload-path.mjs';
@@ -37,6 +37,22 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
  * live in payload-path.mjs so the Tauri shell answers with the same list; a broken update must never cost a player
  * the game, so an unusable overlay is skipped and the reason is kept for the log line below.
  */
+/**
+ * A payload's own game version, for the "reinstalled a fuller installer" rule (payload-path.mjs): the applied
+ * update's build.json says what code the overlay runs; update.json (the updater's receipt) is the fallback.
+ */
+function payloadVersion(dir) {
+  for (const [file, keys] of [['build.json', ['game', 'app']], ['update.json', ['version']]]) {
+    try {
+      const j = JSON.parse(readFileSync(path.join(dir, file), 'utf8'));
+      const v = keys.reduce((o, k) => (o && typeof o === 'object' ? o[k] : undefined), j);
+      if (typeof v === 'string' && v) return v;
+    } catch { /* next candidate / none */ }
+  }
+  return '';
+}
+
+const isDirPath = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 const WWW_PICK = resolveWww({
   candidates: wwwCandidates({
     env: process.env,
@@ -45,6 +61,8 @@ const WWW_PICK = resolveWww({
     devDir: app.isPackaged ? undefined : path.join(HERE, '..'),
   }),
   isFile: (p) => existsSync(p) && statSync(p).isFile(),
+  isDir: isDirPath,
+  versionOf: payloadVersion,
 });
 const WWW = WWW_PICK.dir
   || (app.isPackaged ? path.join(process.resourcesPath, 'www') : path.join(HERE, '..', 'build', 'client', 'www'));
@@ -86,6 +104,7 @@ function startUpdateCheck() {  if (!app.isPackaged && !process.env.SP_UPDATE) re
   runUpdate({
     payloadDir: path.join(app.getPath('userData'), OVERLAY_DIR),
     artDir: path.join(WWW, 'assets'),
+    localVersion: payloadVersion(WWW),
     log,
     env: process.env,
   }).then((r) => {
