@@ -49,7 +49,8 @@ for f in "${FILES[@]}"; do
   if [ "$size" -lt 1000000 ]; then say "  ✗ ${f} 只有 ${size}B，跳过"; continue; fi
   say "  下完 $(( size / 1048576 )) MB，开始上传"
   # file_path 是**位置参数**，这个版本没有 --file（README 里那是 --file，实测报 No such option）
-  "$QUARK" upload "$local_file" --folder "$FOLDER" --create-dirs -c >> "$LOG" 2>&1
+  # 只留最后 4 KB：未登录时 quarkpan 会一直刷二维码倒计时，直接重定向能把日志写到 40 GB、撑满磁盘
+  "$QUARK" upload "$local_file" --folder "$FOLDER" --create-dirs -c 2>&1 | tail -c 4000 >> "$LOG"
   if [ $? -eq 0 ]; then
     say "  ✓ ${f} 已上传"
     rm -f "$local_file"
