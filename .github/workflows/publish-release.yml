@@ -1,0 +1,111 @@
+# publish-release.yml — 把已有构建 run 的产物直接发成 GitHub Release。
+#
+# 为什么要有这个文件：产物在 GitHub 的 artifact 存储里，本地 `gh run download` 再
+# `gh release upload` 要把 ~8 GB 搬下再搬上（跨境链路实测极慢）。这里用
+# actions/download-artifact 的跨 run 下载（run-id），让 GitHub 内网完成搬运，
+# 再按 c5x 的命名约定改名后发布。零本地传输。
+#
+# 用法（workflow_dispatch）：
+#   gh workflow run publish-release.yml \
+#     -f tag=v0.3.1-c52 \
+#     -f clients_run_id=<build-clients run id> \
+#     -f tauri_run_id=<build-tauri run id>
+name: publish-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag，例如 v0.3.1-c52'
+        required: true
+      clients_run_id:
+        description: 'build-clients 的 run id（Electron 四平台）'
+        required: true
+      tauri_run_id:
+        description: 'build-tauri 的 run id（Tauri 安装包）'
+        required: true
+      title:
+        description: 'Release 标题前缀（默认：卫戍协议：盟约 · 客户端）'
+        required: false
+        default: '卫戍协议：盟约 · 客户端'
+      notes:
+        description: 'Release 说明'
+        required: false
+        default: '内置 EasyTier 虚拟局域网（免服务器联机）。修复：房间列表不显示（directoryUrl 空串）。'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: 下载 build-clients 产物
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.clients_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dl
+
+      - name: 下载 build-tauri 产物
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.tauri_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: dl
+
+      - name: 按 c5x 约定改名并汇总
+        run: |
+          set -euo pipefail
+          echo "=== 下载到的文件 ==="
+          find dl -type f | sort
+          mkdir -p out
+
+          # Windows 安装/便携/MSI（桌面目录版）
+          setup=$(find dl -name '*-Setup.exe' ! -name '*Tauri*' | head -1)
+          portable=$(find dl -name '*-portable.exe' | head -1)
+          msi=$(find dl -name '*.msi' | head -1)
+          [ -n "$setup" ] && cp -v "$setup" out/
+          [ -n "$portable" ] && cp -v "$portable" out/
+          [ -n "$msi" ] && cp -v "$msi" out/
+
+          # 桌面 win 压缩包 / Tauri / Android / iOS / macOS 两架构
+          dz=$(find dl -name 'StrongholdProtocol-desktop*.zip' ! -name '*dir*' | head -1)
+          [ -n "$dz" ] && cp -v "$dz" "out/StrongholdProtocol-desktop-win-0.3.1-${TAG#v0.3.1-}.zip"
+          tauri=$(find dl -name 'StrongholdProtocolTauri-*-setup.exe' | head -1)
+          [ -n "$tauri" ] && cp -v "$tauri" "out/StrongholdProtocolTauri-0.3.1-${TAG#v0.3.1-}-setup.exe"
+          apk=$(find dl -name 'app-release.apk' | head -1)
+          [ -n "$apk" ] && cp -v "$apk" "out/Stronghold-0.3.1-${TAG#v0.3.1-}-android-release.apk"
+          ipa=$(find dl -name '*.ipa' | head -1)
+          [ -n "$ipa" ] && cp -v "$ipa" "out/Stronghold-0.3.1-${TAG#v0.3.1-}-ios-unsigned.ipa"
+          for f in $(find dl -name '*.dmg'); do
+            case "$f" in
+              *arm64*) cp -v "$f" out/StrongholdProtocol-0.3.1-mac-arm64.dmg ;;
+              *)       cp -v "$f" out/StrongholdProtocol-0.3.1-mac-x64.dmg ;;
+            esac
+          done
+
+          echo "=== 发布清单 ==="
+          ls -la out
+          # 至少要有 Setup + Tauri，防止改名规则漂了还在"发布成功"
+          [ -f "out/StrongholdProtocol-0.3.1-Setup.exe" ] || { echo "缺 Setup.exe"; exit 1; }
+          [ -n "$(ls out/*Tauri*-setup.exe 2>/dev/null)" ] || { echo "缺 Tauri 安装包"; exit 1; }
+
+      - name: 创建或更新 Release
+        run: |
+          set -euo pipefail
+          TITLE="${{ inputs.title }} $TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，改为追加上传（--clobber）"
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* \
+              --title "$TITLE" \
+              --notes "${{ inputs.notes }}"
+          fi
+          echo "=== 完成 ==="
+          gh release view "$TAG" --json url,assets --jq '"\(.url)", (.assets[] | "  \(.name) | \(.size)")'
