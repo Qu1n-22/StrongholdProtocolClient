@@ -1,0 +1,83 @@
+# make-payload.yml — 从既有 release 的桌面 zip 里重新抽 www，打成 payload。
+#
+# 背景：c50/c51 没有单独发 payload release，而 c52 误用了合并前的 payload-v0.3.1-c49
+# （缺 js/render/fx/*、js/render/vfx/* 与 spine 清单）→ 客户端皮肤/特效 UI 消失。
+# 这个 workflow 从 c51 的桌面 zip（含合并后的 www）重新打包，全程 GitHub 内网搬运。
+#
+# 用法：
+#   gh workflow run make-payload.yml -f source_tag=v0.3.1-c51 \
+#     -f source_asset=StrongholdProtocol-desktop-win-0.3.1-c51.zip \
+#     -f out_tag=payload-v0.3.1-c53
+name: make-payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: '源 release tag（含桌面 zip）'
+        required: true
+        default: 'v0.3.1-c51'
+      source_asset:
+        description: '源资产文件名'
+        required: true
+        default: 'StrongholdProtocol-desktop-win-0.3.1-c51.zip'
+      out_tag:
+        description: '输出的 payload release tag'
+        required: true
+        default: 'payload-v0.3.1-c53'
+
+permissions:
+  contents: write
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      SRC_TAG: ${{ inputs.source_tag }}
+      SRC_ASSET: ${{ inputs.source_asset }}
+      OUT_TAG: ${{ inputs.out_tag }}
+    steps:
+      - name: 下载源桌面 zip
+        run: |
+          set -euo pipefail
+          mkdir -p src ext
+          gh release download "$SRC_TAG" -p "$SRC_ASSET" -D src
+          ls -la src
+
+      - name: 抽出 www
+        run: |
+          set -euo pipefail
+          unzip -q "src/$SRC_ASSET" 'build/desktop/win-unpacked/resources/www/*' -d ext
+          WWW=ext/build/desktop/win-unpacked/resources/www
+          test -f "$WWW/index.html"
+          test -f "$WWW/build.json"
+          test -f "$WWW/js/runtime-config.js"
+          echo "fx_modules=$(find "$WWW/js/render/fx" -type f 2>/dev/null | wc -l)"
+          echo "vfx_modules=$(find "$WWW/js/render/vfx" -type f 2>/dev/null | wc -l)"
+          echo "spine_files=$(find "$WWW" -iname '*spine*' | wc -l)"
+          # 关键闸门：合并后的 www 必须有 fx/vfx，否则就是又抽到了旧包
+          test "$(find "$WWW/js/render/fx" -type f 2>/dev/null | wc -l)" -gt 0
+          test "$(find "$WWW/js/render/vfx" -type f 2>/dev/null | wc -l)" -gt 0
+
+      - name: 打成 payload
+        run: |
+          set -euo pipefail
+          WWW=ext/build/desktop/win-unpacked/resources/www
+          tar -czf sp-client-payload.tar.gz -C "$WWW" .
+          ls -la sp-client-payload.tar.gz
+          echo "--- 顶层关键文件 ---"
+          tar tzf sp-client-payload.tar.gz | grep -E '^(index.html|build.json|js/runtime-config.js)$' || true
+
+      - name: 发布 payload release
+        run: |
+          set -euo pipefail
+          if gh release view "$OUT_TAG" >/dev/null 2>&1; then
+            gh release upload "$OUT_TAG" sp-client-payload.tar.gz --clobber
+          else
+            gh release create "$OUT_TAG" sp-client-payload.tar.gz \
+              --title "payload 0.3.1 ($OUT_TAG)" \
+              --notes "从 $SRC_TAG 的桌面 zip 重新抽取 www（含合并后的 js/render/fx + vfx + spine 清单）。"
+          fi
+          gh release view "$OUT_TAG" --json assets --jq '.assets[] | "\(.name) | \(.size) | \(.url)"'
