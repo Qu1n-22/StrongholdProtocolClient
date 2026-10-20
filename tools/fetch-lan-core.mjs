@@ -70,7 +70,9 @@ export function buildLanConfig(env = {}) {
       networkName,
       networkSecret,
       peers,
-      directoryUrl: String(env.SP_LAN_DIRECTORY_URL ?? 'https://sp.lain42.top/api/lan/v1/rooms').trim(),
+      // GitHub 把「引用了不存在的 secret」解析成空串而不是 undefined —— `??` 兜不住空串，
+      // 必须用 `||`，否则打出来的 lan-config.json 里 directoryUrl 是 ""，玩家永远看不到房间列表。
+      directoryUrl: (String(env.SP_LAN_DIRECTORY_URL ?? '').trim() || 'https://sp.lain42.top/api/lan/v1/rooms'),
       officialVirtualIp: String(env.SP_LAN_OFFICIAL_IP ?? '10.126.126.1').trim(),
       port: Number(env.SP_LAN_GAME_PORT ?? 5150),
     },

@@ -69,6 +69,18 @@ test('buildLanConfig accepts a comma separated peer list too', () => {
   assert.deepEqual(config.peers, ['a', 'b']);
 });
 
+test('an empty SP_LAN_DIRECTORY_URL falls back to the default instead of shipping ""', () => {
+  // 真实事故：workflow 写的是 ${{ secrets.SP_LAN_DIRECTORY_URL }}，但那个 secret 从来没建过，
+  // GitHub 给的是空串（不是 undefined），旧的 `??` 兜不住 → c51 的 lan-config.json 里
+  // directoryUrl 成了 ""，玩家永远看不到房间列表。空串/纯空白都必须回落到默认值。
+  const base = { SP_LAN_NETWORK_NAME: 'n', SP_LAN_NETWORK_SECRET: 's', SP_LAN_PEERS: 'a' };
+  const DEF = 'https://sp.lain42.top/api/lan/v1/rooms';
+  assert.equal(buildLanConfig({ ...base, SP_LAN_DIRECTORY_URL: '' }).config.directoryUrl, DEF);
+  assert.equal(buildLanConfig({ ...base, SP_LAN_DIRECTORY_URL: '   ' }).config.directoryUrl, DEF);
+  // 显式给了值就尊重它。
+  assert.equal(buildLanConfig({ ...base, SP_LAN_DIRECTORY_URL: 'https://example.com/r' }).config.directoryUrl, 'https://example.com/r');
+});
+
 test('the default mirror is the measured-fast one and is a prefix, not a full URL', () => {
   assert.equal(DEFAULT_MIRROR, 'https://gh.dev.438250.xyz/');
   assert.equal(DEFAULT_MIRROR.endsWith('/'), true);
