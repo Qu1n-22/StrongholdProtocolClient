@@ -1,16 +1,15 @@
 name: build-ours
 
-# 我们的安卓包 — 拼装模式:
-#   素材 = 本仓库 release 的四个资源包(essential/fx/voice/skin, 在 PC 上, 不占服务器带宽)
-#   代码 = 同一 release 的 sp-code.tar.gz(服务器上生成, 仅 7MB)
-#   CI 解开两者拼成 payload → 校验(只连本站/无选择器/素材量) → 打 APK → 签名 → artifact
+# 我们的安卓包 — 服务器直供模式:
+#   payload = 服务器上生成的完整包(代码+素材+本站地址), CI 构建时从服务器拉取
+#   构建时段选 0 人在线时(占用服务器带宽约 1 小时)
+#   校验闸门: 只连本站/无选择器/素材量 → 打 APK → 签名 → artifact
 
 on:
   workflow_dispatch:
 
 env:
   NODE_VERSION: '22'
-  RELEASE_BASE: https://github.com/Qu1n-22/StrongholdProtocolClient/releases/download/payload
 
 jobs:
   android:
@@ -53,21 +52,15 @@ jobs:
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
-      - name: 下载素材（代码包 + 四资源包）
+      - name: 下载并解压 payload（服务器直供）
         run: |
           set -euo pipefail
-          curl -fL --retry 3 --retry-delay 3 "$RELEASE_BASE/sp-code.tar.gz" -o sp-code.tar.gz
-          for P in essential fx voice skin; do
-            curl -fL --retry 3 --retry-delay 3 "$RELEASE_BASE/stronghold-resources-$P-475a5205a217.zip" -o "$P.zip"
-          done
-          ls -lh sp-code.tar.gz *.zip
-
-      - name: 拼装 payload
-        run: |
-          set -euo pipefail
+          URL="https://101.43.97.133/download/sp-payload.tar.gz"
+          echo "payload: $URL"
           mkdir -p build/client/www
-          tar -xzf sp-code.tar.gz -C build/client
-          python3 tools/unpack_packs.py essential.zip fx.zip voice.zip skin.zip --out build/client/www
+          curl -fL --retry 5 --retry-delay 5 -C - "$URL" -o payload.tar.gz
+          ls -lh payload.tar.gz
+          tar -xzf payload.tar.gz -C build/client
           echo "payload 文件数: $(find build/client/www -type f | wc -l)"
 
       - name: 校验 payload（完整性 + 服务器锁定）
