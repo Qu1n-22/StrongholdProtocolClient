@@ -41,11 +41,10 @@ jobs:
           [ -n "${KS_PASS:-}" ] || { echo "缺 secret ANDROID_KEYSTORE_PASSWORD"; exit 1; }
           mkdir -p mobile/android/keystore
           printf '%s' "$KS_B64" | base64 -d > mobile/android/keystore/upload-keystore.p12
-          printf 'storeFile=keystore/upload-keystore.p12
-storePassword=%s
-keyAlias=stronghold
-keyPassword=%s
-' "$KS_PASS" "$KS_PASS" > mobile/android/keystore.properties
+          echo "storeFile=keystore/upload-keystore.p12" > mobile/android/keystore.properties
+          echo "storePassword=$KS_PASS" >> mobile/android/keystore.properties
+          echo "keyAlias=stronghold" >> mobile/android/keystore.properties
+          echo "keyPassword=$KS_PASS" >> mobile/android/keystore.properties
           keytool -list -keystore mobile/android/keystore/upload-keystore.p12 -storepass "$KS_PASS" -alias stronghold > /dev/null
           echo "keystore 可解"
 
@@ -77,7 +76,8 @@ keyPassword=%s
           for f in index.html js/runtime-config.js js/net.js; do
             test -f "build/client/www/$f" || { echo "缺 $f"; exit 1; }
           done
-          test ! -f build/client/www/js/shell/picker.js && echo "OK: 无服务器选择器" || { echo "payload 含选择器, 拒绝构建"; exit 1; }
+          if [ -f build/client/www/js/shell/picker.js ]; then echo "payload 含选择器, 拒绝构建"; exit 1; fi
+          echo "OK: 无服务器选择器"
           ASSETS=$(find build/client/www/assets -type f 2>/dev/null | wc -l)
           echo "素材文件数: $ASSETS"
           test "$ASSETS" -gt 3000 || { echo "素材不完整"; exit 1; }
