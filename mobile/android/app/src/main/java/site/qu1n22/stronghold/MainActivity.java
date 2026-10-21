@@ -1,4 +1,4 @@
-package site.starst.stronghold;
+package site.qu1n22.stronghold;
 
 import android.app.AlertDialog;
 import android.net.http.SslError;

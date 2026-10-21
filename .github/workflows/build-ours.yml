@@ -1,0 +1,103 @@
+name: build-ours
+
+# 我们的安卓包: payload 来自本仓库 release 的 sp-payload.tar.gz (服务器上生成, 素材全本地),
+# 只连 https://101.43.97.133/, 无服务器切换 UI。签名经 Secrets 注入, 产物为 APK artifact。
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_url:
+        description: 'payload tar.gz 地址 (默认本仓库 release)'
+        required: false
+        default: 'https://github.com/Qu1n-22/StrongholdProtocolClient/releases/download/payload/sp-payload.tar.gz'
+      server:
+        description: '校验: runtime-config.js 应指向的服务器'
+        required: false
+        default: 'https://101.43.97.133/'
+
+env:
+  NODE_VERSION: '22'
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: 准备固定签名钥匙（release）
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "${KS_B64:-}" ] || { echo "缺 secret ANDROID_KEYSTORE_BASE64"; exit 1; }
+          [ -n "${KS_PASS:-}" ] || { echo "缺 secret ANDROID_KEYSTORE_PASSWORD"; exit 1; }
+          mkdir -p mobile/android/keystore
+          printf '%s' "$KS_B64" | base64 -d > mobile/android/keystore/upload-keystore.p12
+          printf 'storeFile=keystore/upload-keystore.p12
+storePassword=%s
+keyAlias=stronghold
+keyPassword=%s
+' "$KS_PASS" "$KS_PASS" > mobile/android/keystore.properties
+          keytool -list -keystore mobile/android/keystore/upload-keystore.p12 -storepass "$KS_PASS" -alias stronghold > /dev/null
+          echo "keystore 可解"
+
+      - name: 安装 Android SDK 组件
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER=$(find "$SDK/cmdline-tools" -maxdepth 3 -name sdkmanager -type f | sort | tail -1)
+          test -n "$SDKMANAGER" || { echo "找不到 sdkmanager"; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: 下载并解压 payload
+        run: |
+          set -euo pipefail
+          URL="${{ github.event.inputs.payload_url }}"
+          echo "payload: $URL"
+          mkdir -p build/client/www
+          curl -fL --retry 3 --retry-delay 3 "$URL" -o payload.tar.gz
+          ls -lh payload.tar.gz
+          tar -xzf payload.tar.gz -C build/client/www
+          echo "解压文件数: $(find build/client/www -type f | wc -l)"
+
+      - name: 校验 payload（完整性 + 服务器锁定）
+        run: |
+          set -euo pipefail
+          for f in index.html js/runtime-config.js js/net.js; do
+            test -f "build/client/www/$f" || { echo "缺 $f"; exit 1; }
+          done
+          test ! -f build/client/www/js/shell/picker.js && echo "OK: 无服务器选择器" || { echo "payload 含选择器, 拒绝构建"; exit 1; }
+          ASSETS=$(find build/client/www/assets -type f 2>/dev/null | wc -l)
+          echo "素材文件数: $ASSETS"
+          test "$ASSETS" -gt 3000 || { echo "素材不完整"; exit 1; }
+          echo "--- runtime-config.js ---"; cat build/client/www/js/runtime-config.js
+          grep -q "101.43.97.133" build/client/www/js/runtime-config.js || { echo "服务器地址不对"; exit 1; }
+          cat build/client/www/build.json
+
+      - name: 构建 APK
+        run: |
+          set -euo pipefail
+          cd mobile
+          npm ci --no-audit --no-fund
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: stronghold-ours-apk
+          path: mobile/android/app/build/outputs/apk/release/*.apk
+          retention-days: 14

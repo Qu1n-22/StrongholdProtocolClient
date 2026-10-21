@@ -1,4 +1,4 @@
-package site.starst.stronghold;
+package site.qu1n22.stronghold;
 
 import android.content.Context;
 import android.content.SharedPreferences;

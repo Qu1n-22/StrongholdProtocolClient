@@ -30,10 +30,10 @@ if (wantsRelease && !hasUploadKey) {
 }
 
 android {
-    namespace = "site.starst.stronghold"
+    namespace = "site.qu1n22.stronghold"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "site.starst.stronghold"
+        applicationId "site.qu1n22.stronghold"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 301

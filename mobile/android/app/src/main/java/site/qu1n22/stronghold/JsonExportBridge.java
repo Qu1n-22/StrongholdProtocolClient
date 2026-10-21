@@ -1,4 +1,4 @@
-package site.starst.stronghold;
+package site.qu1n22.stronghold;
 
 import android.app.Activity;
 import android.content.res.Resources;
